@@ -19,6 +19,7 @@ jobs:
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --check
       - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --locked --workspace --all-features
+      - run: cargo test --locked -p vouchkit-server --no-default-features
       - run: cargo doc --locked --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

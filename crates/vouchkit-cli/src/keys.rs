@@ -1,19 +1,26 @@
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD_NO_PAD;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use std::{fs, path::Path};
-use vouchkit_core::protocol::{decode_public_key, parse_master_public_key};
-use vouchkit_core::{DeviceProver, SigningKey, random_bytes};
+use vouchkit_core::protocol::{
+    encode_master_key, encode_signing_public_key, parse_master_key, parse_signing_public_key,
+};
+use vouchkit_core::{
+    DeviceKeyError, DeviceProver, PublicKey, SigningAlgorithm, SigningProvider, SoftwareSigningKey,
+    generate_signing_seed, random_bytes,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::files::{self, Destination, PendingFile};
 
 const MASTER_ENCRYPTED: &[u8] = b"VOUCHKIT-MASTER-1\0";
 const MASTER_PLAINTEXT: &[u8] = b"VOUCHKIT-MASTER-PLAINTEXT-1\0";
-const DELEGATE: &str = "VOUCHKIT-DELEGATE-1\n";
+const MASTER_ENCRYPTED_P256: &[u8] = b"VOUCHKIT-MASTER-P256-2\0";
+const MASTER_PLAINTEXT_P256: &[u8] = b"VOUCHKIT-MASTER-PLAINTEXT-P256-2\0";
+const DELEGATE: &[u8] = b"VOUCHKIT-DELEGATE-1\n";
+const DELEGATE_P256: &[u8] = b"VOUCHKIT-DELEGATE-P256-2\n";
+const DEVICE_P256: &[u8] = b"VOUCHKIT-DEVICE-P256-2\0";
 const MEMORY_KIB: u32 = 64 * 1024;
 const ITERATIONS: u32 = 3;
 const LANES: u32 = 1;
@@ -23,16 +30,27 @@ const MAX_PASS_BYTES: usize = 4096;
 pub(crate) struct MasterKey {
     pub(crate) id: u8,
     pub(crate) seed: Zeroizing<[u8; 32]>,
+    pub(crate) signing: SoftwareSigningKey,
+    algorithm: SigningAlgorithm,
 }
 
 impl MasterKey {
-    pub(crate) fn signing_key(&self) -> SigningKey {
-        SigningKey::from_seed(&self.seed)
+    fn from_seed(id: u8, algorithm: SigningAlgorithm, seed: Zeroizing<[u8; 32]>) -> Result<Self> {
+        let signing =
+            SoftwareSigningKey::from_seed(algorithm, &seed).context("invalid master key seed")?;
+        Ok(Self {
+            id,
+            seed,
+            signing,
+            algorithm,
+        })
     }
 
     pub(crate) fn read(path: &Path, passphrase_file: Option<&Path>) -> Result<Self> {
         let bytes = files::read_secret(path, MAX_KEY_BYTES)?;
-        if let Some(plaintext) = bytes.strip_prefix(MASTER_PLAINTEXT) {
+        if let Some((algorithm, plaintext)) =
+            algorithm_and_body(&bytes, MASTER_PLAINTEXT, MASTER_PLAINTEXT_P256)
+        {
             let (&id, seed) = plaintext
                 .split_first()
                 .context("invalid plaintext master key")?;
@@ -40,10 +58,11 @@ impl MasterKey {
                 passphrase_file.is_none(),
                 "a plaintext master key does not use a passphrase"
             );
-            return Ok(Self {
+            return Self::from_seed(
                 id,
-                seed: Zeroizing::new(seed.try_into().context("invalid plaintext master key")?),
-            });
+                algorithm,
+                Zeroizing::new(seed.try_into().context("invalid plaintext master key")?),
+            );
         }
 
         let parsed = EncryptedMaster::parse(&bytes)?;
@@ -60,20 +79,22 @@ impl MasterKey {
                 )
                 .map_err(|_| anyhow!("wrong master key passphrase or damaged key file"))?,
         );
-        Ok(Self {
-            id: parsed.id,
-            seed: Zeroizing::new(
+        Self::from_seed(
+            parsed.id,
+            parsed.algorithm,
+            Zeroizing::new(
                 seed.as_slice()
                     .try_into()
                     .context("invalid master key seed")?,
             ),
-        })
+        )
     }
 }
 
 pub(crate) fn keygen_master(
     dir: &Path,
     id: u8,
+    algorithm: SigningAlgorithm,
     insecure_plaintext: bool,
     passphrase_file: Option<&Path>,
 ) -> Result<()> {
@@ -95,18 +116,20 @@ pub(crate) fn keygen_master(
     for path in &paths {
         files::require_absent(path)?;
     }
-    let master = MasterKey {
+    let master = MasterKey::from_seed(
         id,
-        seed: Zeroizing::new(random_bytes()?),
-    };
-    let public = master.signing_key().public();
+        algorithm,
+        Zeroizing::new(generate_signing_seed(algorithm)?),
+    )?;
+    let public = master.signing.public_key();
     let private = if insecure_plaintext {
         ensure!(
             passphrase_file.is_none(),
             "--passphrase-file conflicts with --insecure-plaintext"
         );
-        let mut file = Zeroizing::new(Vec::with_capacity(MASTER_PLAINTEXT.len() + 33));
-        file.extend_from_slice(MASTER_PLAINTEXT);
+        let header = marker(algorithm, MASTER_PLAINTEXT, MASTER_PLAINTEXT_P256)?;
+        let mut file = Zeroizing::new(Vec::with_capacity(header.len() + 33));
+        file.extend_from_slice(header);
         file.push(id);
         file.extend_from_slice(master.seed.as_slice());
         file
@@ -121,8 +144,16 @@ pub(crate) fn keygen_master(
         }
         Zeroizing::new(encrypt_master(&master, &password)?)
     };
-    let public_text = format!("{id}:{}\n", STANDARD_NO_PAD.encode(public));
-    let rust = format!("pub const PUBLIC_KEYS: &[(u8, [u8; 32])] = &[({id}, {public:?})];\n");
+    let public_text = format!("{}\n", encode_master_key(id, public));
+    let rust = match public {
+        PublicKey::Ed25519(bytes) => {
+            format!("pub const PUBLIC_KEYS: &[(u8, [u8; 32])] = &[({id}, {bytes:?})];\n")
+        }
+        PublicKey::P256(bytes) => format!(
+            "pub const PUBLIC_KEYS: &[(u8, vouchkit_core::PublicKey)] = &[({id}, vouchkit_core::PublicKey::P256({bytes:?}))];\n"
+        ),
+        _ => bail!("unsupported signing algorithm"),
+    };
     let references = [private.as_slice(), public_text.as_bytes(), rust.as_bytes()];
     let pending: Vec<_> = paths
         .iter()
@@ -135,67 +166,104 @@ pub(crate) fn keygen_master(
     Ok(())
 }
 
-pub(crate) fn keygen_delegate(dir: &Path) -> Result<()> {
+pub(crate) fn keygen_delegate(dir: &Path, algorithm: SigningAlgorithm) -> Result<()> {
     fs::create_dir_all(dir).context("creating delegate key directory")?;
     let _lock = crate::ledger::lock_path(&dir.join(".vouch-keygen"))?;
     let paths = [dir.join("delegate.key"), dir.join("delegate.pub")];
     for path in &paths {
         files::require_absent(path)?;
     }
-    let seed: Zeroizing<[u8; 32]> = Zeroizing::new(random_bytes()?);
-    let mut private = Zeroizing::new(String::with_capacity(DELEGATE.len() + 65));
-    private.push_str(DELEGATE);
+    let seed = Zeroizing::new(generate_signing_seed(algorithm)?);
+    let header = marker(algorithm, DELEGATE, DELEGATE_P256)?;
+    let mut private = Zeroizing::new(Vec::with_capacity(header.len() + 65));
+    private.extend_from_slice(header);
     let mut encoded = Zeroizing::new([0; 64]);
     hex::encode_to_slice(seed.as_slice(), encoded.as_mut_slice())
         .context("encoding delegate key")?;
-    private.push_str(std::str::from_utf8(encoded.as_slice())?);
+    private.extend_from_slice(encoded.as_slice());
     encoded.zeroize();
-    private.push('\n');
-    let public = format!(
-        "{}\n",
-        STANDARD_NO_PAD.encode(SigningKey::from_seed(&seed).public())
-    );
-    let pending_private = PendingFile::new(&paths[0], private.as_bytes())?;
+    private.push(b'\n');
+    let signer = SoftwareSigningKey::from_seed(algorithm, &seed)?;
+    let public = format!("{}\n", encode_signing_public_key(signer.public_key()));
+    let pending_private = PendingFile::new(&paths[0], &private)?;
     let pending_public = PendingFile::new(&paths[1], public.as_bytes())?;
     pending_private.persist(&paths[0], Destination::New)?;
     pending_public.persist(&paths[1], Destination::New)
 }
 
-pub(crate) fn read_master_public(path: &Path) -> Result<(u8, [u8; 32])> {
+pub(crate) fn read_master_public(path: &Path) -> Result<(u8, PublicKey)> {
     let bytes = files::read(path, MAX_KEY_BYTES)?;
-    parse_master_public_key(std::str::from_utf8(&bytes)?)
-        .context("expected a master public key as key_id:base64")
+    parse_master_key(std::str::from_utf8(&bytes)?)
+        .context("expected a master public key with key ID and public key")
 }
 
-pub(crate) fn read_delegate_public(path: &Path) -> Result<[u8; 32]> {
+pub(crate) fn read_delegate_public(path: &Path) -> Result<PublicKey> {
     let bytes = files::read(path, MAX_KEY_BYTES)?;
     parse_public(std::str::from_utf8(&bytes)?)
 }
 
-pub(crate) fn parse_public(input: &str) -> Result<[u8; 32]> {
-    decode_public_key(input).context("expected a Base64 Ed25519 public key")
+pub(crate) fn parse_public(input: &str) -> Result<PublicKey> {
+    parse_signing_public_key(input).context("expected an Ed25519 or P-256 public key")
 }
 
-pub(crate) struct DeviceKey(SigningKey);
+pub(crate) struct DeviceKey(SoftwareSigningKey);
 
 impl DeviceKey {
     pub(crate) fn read(path: &Path) -> Result<Self> {
-        let bytes = files::read_secret(path, 32)?;
-        let seed: &[u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .context("invalid device key file")?;
-        Ok(Self(SigningKey::from_seed(seed)))
+        let bytes = files::read_secret(path, DEVICE_P256.len() + 32)?;
+        let (algorithm, seed) = if bytes.len() == 32 {
+            (SigningAlgorithm::Ed25519, bytes.as_slice())
+        } else {
+            (
+                SigningAlgorithm::P256,
+                bytes
+                    .strip_prefix(DEVICE_P256)
+                    .context("unknown device key format")?,
+            )
+        };
+        let seed: &[u8; 32] = seed.try_into().context("invalid device key file length")?;
+        Ok(Self(
+            SoftwareSigningKey::from_seed(algorithm, seed).context("invalid device key seed")?,
+        ))
     }
 }
 
 impl DeviceProver for DeviceKey {
-    fn public(&self) -> [u8; 32] {
-        self.0.public()
+    fn public(&self) -> PublicKey {
+        self.0.public_key()
     }
 
-    fn sign(&self, message: &[u8]) -> Result<[u8; 64], vouchkit_core::DeviceKeyError> {
-        Ok(self.0.sign(message))
+    fn sign(&self, message: &[u8]) -> Result<[u8; 64], DeviceKeyError> {
+        self.0
+            .try_sign(message)
+            .map_err(|_| DeviceKeyError::SigningFailed)
+    }
+}
+
+fn algorithm_and_body<'a>(
+    bytes: &'a [u8],
+    ed25519: &[u8],
+    p256: &[u8],
+) -> Option<(SigningAlgorithm, &'a [u8])> {
+    bytes
+        .strip_prefix(ed25519)
+        .map(|rest| (SigningAlgorithm::Ed25519, rest))
+        .or_else(|| {
+            bytes
+                .strip_prefix(p256)
+                .map(|rest| (SigningAlgorithm::P256, rest))
+        })
+}
+
+fn marker(
+    algorithm: SigningAlgorithm,
+    ed25519: &'static [u8],
+    p256: &'static [u8],
+) -> Result<&'static [u8]> {
+    match algorithm {
+        SigningAlgorithm::Ed25519 => Ok(ed25519),
+        SigningAlgorithm::P256 => Ok(p256),
+        _ => bail!("unsupported signing algorithm"),
     }
 }
 
@@ -262,7 +330,11 @@ fn encrypt_master(master: &MasterKey, password: &[u8]) -> Result<Vec<u8>> {
     };
     let salt = random_bytes()?;
     let nonce: [u8; 24] = random_bytes()?;
-    let mut header = Vec::from(MASTER_ENCRYPTED);
+    let mut header = Vec::from(marker(
+        master.algorithm,
+        MASTER_ENCRYPTED,
+        MASTER_ENCRYPTED_P256,
+    )?);
     header.push(master.id);
     header.extend(kdf.memory_kib.to_be_bytes());
     header.extend(kdf.iterations.to_be_bytes());
@@ -284,6 +356,7 @@ fn encrypt_master(master: &MasterKey, password: &[u8]) -> Result<Vec<u8>> {
 
 struct EncryptedMaster<'a> {
     id: u8,
+    algorithm: SigningAlgorithm,
     kdf: Kdf,
     salt: &'a [u8; 16],
     nonce: &'a [u8; 24],
@@ -293,8 +366,7 @@ struct EncryptedMaster<'a> {
 
 impl<'a> EncryptedMaster<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self> {
-        let tail = bytes
-            .strip_prefix(MASTER_ENCRYPTED)
+        let (algorithm, tail) = algorithm_and_body(bytes, MASTER_ENCRYPTED, MASTER_ENCRYPTED_P256)
             .context("unknown master key format")?;
         let (&id, tail) = tail
             .split_first()
@@ -318,6 +390,7 @@ impl<'a> EncryptedMaster<'a> {
         kdf.params()?;
         Ok(Self {
             id,
+            algorithm,
             kdf,
             salt,
             nonce,
@@ -335,8 +408,13 @@ fn part<const N: usize>(input: &[u8]) -> Result<(&[u8; N], &[u8])> {
 
 #[cfg(test)]
 mod tests {
-    use super::{EncryptedMaster, ITERATIONS, LANES, MASTER_ENCRYPTED, MEMORY_KIB};
+    use super::{
+        EncryptedMaster, ITERATIONS, LANES, MASTER_ENCRYPTED, MASTER_PLAINTEXT,
+        MASTER_PLAINTEXT_P256, MEMORY_KIB, MasterKey,
+    };
+    use crate::files::{self, Destination};
     use anyhow::Result;
+    use vouchkit_core::{SigningAlgorithm, SigningKey, SigningProvider};
 
     fn header(memory: u32, iterations: u32, lanes: u32) -> Vec<u8> {
         let mut bytes = Vec::from(MASTER_ENCRYPTED);
@@ -353,6 +431,7 @@ mod tests {
         let standard = header(MEMORY_KIB, ITERATIONS, LANES);
         let parsed = EncryptedMaster::parse(&standard)?;
         assert_eq!(parsed.id, 9);
+        assert_eq!(parsed.algorithm, SigningAlgorithm::Ed25519);
         assert_eq!(
             parsed.header.len() + parsed.ciphertext.len(),
             standard.len()
@@ -361,6 +440,30 @@ mod tests {
         assert!(EncryptedMaster::parse(&header(u32::MAX, ITERATIONS, LANES)).is_err());
         assert!(EncryptedMaster::parse(&header(MEMORY_KIB, 1, LANES)).is_err());
         assert!(EncryptedMaster::parse(&header(MEMORY_KIB, ITERATIONS, 0)).is_err());
+        Ok(())
+    }
+    #[test]
+    fn accepts_legacy_master_bytes_and_checks_p256_scalars() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let legacy = directory.path().join("legacy.key");
+        let invalid = directory.path().join("invalid.key");
+        let mut legacy_bytes = Vec::from(MASTER_PLAINTEXT);
+        legacy_bytes.push(7);
+        legacy_bytes.extend([11; 32]);
+        files::write(&legacy, &legacy_bytes, Destination::New)?;
+
+        let master = MasterKey::read(&legacy, None)?;
+        assert_eq!(master.id, 7);
+        assert_eq!(
+            master.signing.public_key(),
+            SigningKey::from_seed(&[11; 32]).public().into()
+        );
+
+        let mut invalid_bytes = Vec::from(MASTER_PLAINTEXT_P256);
+        invalid_bytes.push(8);
+        invalid_bytes.extend([0; 32]);
+        files::write(&invalid, &invalid_bytes, Destination::New)?;
+        assert!(MasterKey::read(&invalid, None).is_err());
         Ok(())
     }
 }

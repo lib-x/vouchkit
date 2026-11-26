@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
 use std::path::PathBuf;
-use vouchkit_core::{AppVersion, FeatureSlots, Id};
+use vouchkit_core::{AppVersion, FeatureSlots, Id, SigningAlgorithm};
 
 #[derive(Parser)]
 #[command(
@@ -50,6 +50,9 @@ pub(crate) enum Command {
 pub(crate) struct Keygen {
     #[arg(long, value_enum)]
     pub(crate) kind: KeyKind,
+    /// Algorithm of the generated key pair.
+    #[arg(long, value_enum, default_value = "ed25519")]
+    pub(crate) algorithm: KeyAlgorithm,
     /// Required for a master key.
     #[arg(long)]
     pub(crate) key_id: Option<u8>,
@@ -64,6 +67,21 @@ pub(crate) struct Keygen {
 pub(crate) enum KeyKind {
     Master,
     Delegate,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum KeyAlgorithm {
+    Ed25519,
+    P256,
+}
+
+impl From<KeyAlgorithm> for SigningAlgorithm {
+    fn from(value: KeyAlgorithm) -> Self {
+        match value {
+            KeyAlgorithm::Ed25519 => Self::Ed25519,
+            KeyAlgorithm::P256 => Self::P256,
+        }
+    }
 }
 
 #[derive(Args)]
@@ -125,7 +143,7 @@ pub(crate) struct Issue {
     /// Number of seats for an entitlement. Defaults to one.
     #[arg(long)]
     pub(crate) max_devices: Option<u8>,
-    /// Optional Base64 device public key for a standalone license.
+    /// Optional Ed25519 Base64 or tagged P-256 device public key for a standalone license.
     #[arg(long)]
     pub(crate) device_pub: Option<String>,
     #[arg(long)]
@@ -201,7 +219,7 @@ pub(crate) struct Verify {
     pub(crate) app_version: AppVersion,
     #[arg(long)]
     pub(crate) crl: Option<PathBuf>,
-    /// Local device key for validating a bound license.
+    /// Local Ed25519 or P-256 device key for validating a bound license.
     #[arg(long)]
     pub(crate) device_key: Option<PathBuf>,
 }

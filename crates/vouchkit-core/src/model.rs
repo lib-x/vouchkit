@@ -3,7 +3,7 @@ use std::fmt;
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use crate::{FeatureSlots, SigningError, Verifier, wire::SignedLicense};
+use crate::{FeatureSlots, PublicKey, SigningError, Verifier, wire::SignedLicense};
 
 /// A random identifier for a license, purchase or delegation certificate.
 pub type Id = [u8; 16];
@@ -23,7 +23,7 @@ pub enum Class {
 
 /// The signed claims carried by an authorization.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LicensePayload {
+pub struct LicensePayload<K = PublicKey> {
     /// Type of authorization.
     pub class: Class,
     /// Unique identifier for this signed authorization.
@@ -52,8 +52,8 @@ pub struct LicensePayload {
     pub max_app_version: Option<AppVersion>,
     /// Activation seats on an entitlement.
     pub max_devices: u8,
-    /// Ed25519 public key for a bound device.
-    pub device_pub: Option<[u8; 32]>,
+    /// Algorithm-tagged public key for a bound device.
+    pub device_pub: Option<K>,
     /// Optional diagnostic device hint.
     pub device_hint: Option<Id>,
     /// Optional build-specific tag check values.
@@ -62,7 +62,36 @@ pub struct LicensePayload {
     pub unlock: Vec<(u16, [u8; 32])>,
 }
 
-impl fmt::Debug for LicensePayload {
+impl<K> LicensePayload<K> {
+    pub(crate) fn map_device<T>(
+        mut self,
+        transform: impl FnOnce(K) -> Result<T, LicenseError>,
+    ) -> Result<LicensePayload<T>, LicenseError> {
+        use std::mem::take;
+        Ok(LicensePayload {
+            class: self.class,
+            license_id: self.license_id,
+            entitlement_id: self.entitlement_id,
+            product: take(&mut self.product),
+            subject: take(&mut self.subject),
+            tier: self.tier,
+            features: take(&mut self.features),
+            issued_at: self.issued_at,
+            not_before: self.not_before,
+            expires_at: self.expires_at,
+            renew_after: self.renew_after,
+            grace_secs: self.grace_secs,
+            max_app_version: self.max_app_version,
+            max_devices: self.max_devices,
+            device_pub: self.device_pub.take().map(transform).transpose()?,
+            device_hint: self.device_hint,
+            tags: self.tags,
+            unlock: take(&mut self.unlock),
+        })
+    }
+}
+
+impl<K> fmt::Debug for LicensePayload<K> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LicensePayload")
             .field("class", &self.class)
@@ -78,7 +107,7 @@ impl fmt::Debug for LicensePayload {
     }
 }
 
-impl Drop for LicensePayload {
+impl<K> Drop for LicensePayload<K> {
     fn drop(&mut self) {
         self.unlock.zeroize();
     }
@@ -86,11 +115,11 @@ impl Drop for LicensePayload {
 
 /// Author-signed limits on a delegate's authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DelegationCert {
+pub struct DelegationCert<K = PublicKey> {
     /// Identifier used for revocation.
     pub cert_id: Id,
-    /// Delegate's Ed25519 public key.
-    pub delegate_pub: [u8; 32],
+    /// Delegate's algorithm-tagged public key.
+    pub delegate_pub: K,
     /// Product for which the delegate may sign leases.
     pub product: String,
     /// Earliest permitted issuance time, inclusive.
@@ -103,6 +132,21 @@ pub struct DelegationCert {
     pub max_tier: u8,
     /// Product-defined slots and intervals the delegate may grant.
     pub feature_mask: FeatureSlots,
+}
+
+impl<K> DelegationCert<K> {
+    pub(crate) fn with_delegate<T>(self, delegate_pub: T) -> DelegationCert<T> {
+        DelegationCert {
+            cert_id: self.cert_id,
+            delegate_pub,
+            product: self.product,
+            not_before: self.not_before,
+            not_after: self.not_after,
+            max_lease_secs: self.max_lease_secs,
+            max_tier: self.max_tier,
+            feature_mask: self.feature_mask,
+        }
+    }
 }
 
 /// The claims of an author-signed revocation list.
@@ -130,6 +174,9 @@ pub enum LicenseError {
     /// The envelope version is unsupported.
     #[error("unsupported envelope version")]
     UnsupportedVersion,
+    /// The envelope names an unsupported signature algorithm.
+    #[error("unsupported signature algorithm")]
+    UnsupportedAlgorithm,
     /// The indicated master key is unavailable or ambiguous.
     #[error("unknown or ambiguous master key id")]
     UnknownKeyId,
@@ -216,20 +263,30 @@ pub enum DeviceKeyError {
     SigningFailed,
 }
 
-/// Local interface to an Ed25519 device key, including non-exportable hardware keys.
+/// Local interface to a device signing key, including non-exportable hardware keys.
 ///
 /// An adapter can retain a hardware key handle and delegate signing to the device.
-/// The contract requires an ordinary Ed25519 signature of the supplied message.
+/// The contract requires an canonical signature for the advertised public-key algorithm.
 /// A valid signature establishes possession. Device hardware is not attested.
 pub trait DeviceProver {
-    /// Returns the device's Ed25519 public key.
-    fn public(&self) -> [u8; 32];
+    /// Returns the device's algorithm-tagged public key.
+    fn public(&self) -> PublicKey;
     /// Signs a challenge with the device private key.
     ///
     /// # Errors
     ///
     /// Returns an error when the provider is unavailable or fails to authorize or sign.
     fn sign(&self, msg: &[u8]) -> Result<[u8; 64], DeviceKeyError>;
+}
+
+impl<T: DeviceProver + ?Sized> DeviceProver for Box<T> {
+    fn public(&self) -> PublicKey {
+        self.as_ref().public()
+    }
+
+    fn sign(&self, msg: &[u8]) -> Result<[u8; 64], DeviceKeyError> {
+        self.as_ref().sign(msg)
+    }
 }
 
 /// Application-supplied conditions for local verification.

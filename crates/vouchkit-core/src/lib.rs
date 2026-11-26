@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod algorithm;
 mod codec;
 mod features;
 mod hardening;
@@ -8,6 +9,10 @@ pub mod protocol;
 mod verifier;
 mod wire;
 
+pub use algorithm::{
+    PublicKey, SigningAlgorithm, SigningProvider, SoftwareSigningKey, generate_signing_seed,
+    normalize_p256_der_signature,
+};
 pub use codec::{MAX_TOKEN_TEXT, decode_token, encode_license_file, encode_token};
 pub use features::{FeatureSlots, MAX_FEATURE_RANGES};
 pub use hardening::{

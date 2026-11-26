@@ -1,14 +1,14 @@
-use ed25519_dalek::{Signature, VerifyingKey};
 use zeroize::Zeroizing;
 
 use crate::{
-    Class, Crl, DelegationCert, EntitlementInfo, LicenseError, SignedLicense, StateStore,
-    TagProfile, VerifiedLicense, VerifyOptions, VerifyOutcome, check_clock_with_skew, decode_token,
-    random_bytes,
-    wire::{authenticate_certificate, authenticate_crl, authenticate_license, public_key},
+    Class, Crl, DelegationCert, EntitlementInfo, LicenseError, PublicKey, SignedLicense,
+    SigningAlgorithm, StateStore, TagProfile, VerifiedLicense, VerifyOptions, VerifyOutcome,
+    check_clock_with_skew, decode_token, random_bytes,
+    wire::{authenticate_certificate, authenticate_crl, authenticate_license},
 };
 
 const DEVICE_DOMAIN: &[u8] = b"vouchkit-device-v1\0";
+const DEVICE_DOMAIN_V2: &[u8] = b"vouchkit-device-v2\0";
 const SELF_TEST_KEY: (u8, [u8; 32]) = (
     255,
     [
@@ -17,11 +17,13 @@ const SELF_TEST_KEY: (u8, [u8; 32]) = (
     ],
 );
 const SELF_TEST_GOOD: &[u8] = include_bytes!("self-test.bin");
+const SELF_TEST_P256_KEY: PublicKey = PublicKey::P256(*include_bytes!("self-test-p256.pub"));
+const SELF_TEST_P256_GOOD: &[u8] = include_bytes!("self-test-p256.bin");
 
 /// Verifies author signatures, delegated leases and optional build tags.
 #[derive(Debug, Clone)]
 pub struct Verifier {
-    master_keys: Vec<(u8, [u8; 32])>,
+    master_keys: Vec<(u8, PublicKey)>,
     tag_profile: Option<&'static TagProfile>,
 }
 
@@ -30,7 +32,27 @@ impl Verifier {
     ///
     /// Duplicate key IDs fail closed when an input names the ambiguous ID.
     pub fn new(master_keys: &[(u8, [u8; 32])], tag_profile: Option<&'static TagProfile>) -> Self {
-        let mut master_keys = master_keys.to_vec();
+        let keys: Vec<_> = master_keys
+            .iter()
+            .map(|&(id, key)| (id, key.into()))
+            .collect();
+        Self::from_keys(keys, tag_profile)
+    }
+
+    /// Configures algorithm-tagged trust anchors and an optional build tag profile.
+    ///
+    /// Each identifier must have a single trusted key across all algorithms.
+    pub fn with_public_keys(
+        master_keys: &[(u8, PublicKey)],
+        tag_profile: Option<&'static TagProfile>,
+    ) -> Self {
+        Self::from_keys(master_keys.to_vec(), tag_profile)
+    }
+
+    fn from_keys(
+        mut master_keys: Vec<(u8, PublicKey)>,
+        tag_profile: Option<&'static TagProfile>,
+    ) -> Self {
         master_keys.sort_unstable();
         Self {
             master_keys,
@@ -38,22 +60,35 @@ impl Verifier {
         }
     }
 
-    fn key(&self, id: u8) -> Result<VerifyingKey, LicenseError> {
+    fn key(&self, id: u8) -> Result<PublicKey, LicenseError> {
         let start = self.master_keys.partition_point(|(key_id, _)| *key_id < id);
         let end = self
             .master_keys
             .partition_point(|(key_id, _)| *key_id <= id);
         match self.master_keys.get(start..end) {
-            Some([(_, key)]) => public_key(key),
+            Some([(_, key)]) => Ok(*key),
             _ => Err(LicenseError::UnknownKeyId),
         }
     }
 
     /// Returns a stable fingerprint of the configured master key table.
     pub fn pubkeys_fingerprint(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new_derive_key("vouchkit-pubkeys-v1");
+        let legacy = self
+            .master_keys
+            .iter()
+            .all(|(_, key)| key.algorithm() == SigningAlgorithm::Ed25519);
+        let context = if legacy {
+            "vouchkit-pubkeys-v1"
+        } else {
+            "vouchkit-pubkeys-v2"
+        };
+        let mut hasher = blake3::Hasher::new_derive_key(context);
         for (id, key) in &self.master_keys {
-            hasher.update(&[*id]).update(key);
+            hasher.update(&[*id]);
+            if !legacy {
+                hasher.update(&[key.algorithm().wire_tag()]);
+            }
+            hasher.update(key.as_bytes());
         }
         *hasher.finalize().as_bytes()
     }
@@ -155,16 +190,23 @@ impl Verifier {
                 return Err(LicenseError::DeviceProofFailed);
             }
             let nonce: [u8; 16] = random_bytes()?;
-            let mut challenge = Vec::with_capacity(DEVICE_DOMAIN.len() + 32);
-            challenge.extend_from_slice(DEVICE_DOMAIN);
+            let legacy = expected.algorithm() == SigningAlgorithm::Ed25519;
+            let domain = if legacy {
+                DEVICE_DOMAIN
+            } else {
+                DEVICE_DOMAIN_V2
+            };
+            let mut challenge = Vec::with_capacity(domain.len() + 66);
+            challenge.extend_from_slice(domain);
             challenge.extend_from_slice(&payload.license_id);
             challenge.extend_from_slice(&nonce);
-            let key = public_key(&expected).map_err(|_| LicenseError::DeviceProofFailed)?;
-            key.verify_strict(
-                &challenge,
-                &Signature::from_bytes(&device.sign(&challenge)?),
-            )
-            .map_err(|_| LicenseError::DeviceProofFailed)?;
+            if !legacy {
+                challenge.push(expected.algorithm().wire_tag());
+                challenge.extend_from_slice(expected.as_bytes());
+            }
+            expected
+                .verify(&challenge, &device.sign(&challenge)?)
+                .map_err(|_| LicenseError::DeviceProofFailed)?;
         }
         self.check_tags(&signed)?;
         if payload.class == Class::Entitlement {
@@ -269,18 +311,25 @@ impl Verifier {
     fn run_self_test(
         verify: impl Fn(&Verifier, &[u8], &VerifyOptions<'_>) -> Result<VerifyOutcome, LicenseError>,
     ) -> Result<(), LicenseError> {
-        let verifier = Self::new(&[SELF_TEST_KEY], None);
+        let verifier = Self::with_public_keys(
+            &[
+                (SELF_TEST_KEY.0, SELF_TEST_KEY.1.into()),
+                (254, SELF_TEST_P256_KEY),
+            ],
+            None,
+        );
         let opts = VerifyOptions::new("vouchkit-self-test", (1, 0, 0), 1_700_000_001);
-        let mut damaged = SELF_TEST_GOOD.to_vec();
-        *damaged.last_mut().ok_or(LicenseError::Tampered)? ^= 1;
-        if !matches!(
-            verify(&verifier, SELF_TEST_GOOD, &opts),
-            Ok(VerifyOutcome::Active(_))
-        ) || !matches!(
-            verify(&verifier, &damaged, &opts),
-            Err(LicenseError::BadSignature)
-        ) {
-            return Err(LicenseError::Tampered);
+        for good in [SELF_TEST_GOOD, SELF_TEST_P256_GOOD] {
+            let mut damaged = good.to_vec();
+            *damaged.last_mut().ok_or(LicenseError::Tampered)? ^= 1;
+            if !matches!(verify(&verifier, good, &opts), Ok(VerifyOutcome::Active(_)))
+                || !matches!(
+                    verify(&verifier, &damaged, &opts),
+                    Err(LicenseError::BadSignature)
+                )
+            {
+                return Err(LicenseError::Tampered);
+            }
         }
         Ok(())
     }

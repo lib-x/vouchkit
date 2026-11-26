@@ -12,12 +12,12 @@ use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-use vouchkit_core::protocol::MAX_CRL_BYTES;
+use vouchkit_core::protocol::{MAX_CRL_BYTES, encode_signing_public_key};
 use vouchkit_core::{
-    Class, DelegationCert, DeviceProver, LicensePayload, MAX_TOKEN_TEXT, Verifier, VerifyOptions,
-    VerifyOutcome, asset_seal, decode_token, derive_feature_key, derive_tag_slot, derive_tags,
-    encode_license_file, encode_token, inspect_license, random_bytes, sign_delegation, sign_master,
-    validate_product,
+    Class, DelegationCert, DeviceProver, LicensePayload, MAX_TOKEN_TEXT, PublicKey, Verifier,
+    VerifyOptions, VerifyOutcome, asset_seal, decode_token, derive_feature_key, derive_tag_slot,
+    derive_tags, encode_license_file, encode_token, inspect_license, random_bytes, sign_delegation,
+    sign_master, validate_product,
 };
 use zeroize::Zeroizing;
 
@@ -37,6 +37,7 @@ fn main() -> Result<()> {
                 &args.out_dir,
                 args.key_id
                     .context("--key-id is required for a master key")?,
+                args.algorithm.into(),
                 args.insecure_plaintext,
                 passphrase,
             ),
@@ -45,7 +46,7 @@ fn main() -> Result<()> {
                     args.key_id.is_none() && !args.insecure_plaintext && passphrase.is_none(),
                     "--key-id, --insecure-plaintext and --passphrase-file apply to master keys"
                 );
-                keys::keygen_delegate(&args.out_dir)
+                keys::keygen_delegate(&args.out_dir, args.algorithm.into())
             }
         },
         Command::Delegate(args) => delegate(args, passphrase),
@@ -89,7 +90,7 @@ fn delegate(args: args::Delegate, passphrase: Option<&Path>) -> Result<()> {
         max_tier: args.max_tier,
         feature_mask: args::slots(args.feature_mask, &args.feature_slots)?,
     };
-    let certificate = sign_delegation(master.id, &master.signing_key(), &cert)?;
+    let certificate = sign_delegation(master.id, &master.signing, &cert)?;
     let record = Record::Delegation {
         cert_id: hex::encode(cert.cert_id),
         product: cert.product,
@@ -181,7 +182,7 @@ fn issue(args: args::Issue, passphrase: Option<&Path>) -> Result<()> {
         tags,
         unlock,
     };
-    let signed = Zeroizing::new(sign_master(master.id, &master.signing_key(), &payload)?);
+    let signed = Zeroizing::new(sign_master(master.id, &master.signing, &payload)?);
     let mut output = Zeroizing::new(match args.format {
         OutputFormat::Token => encode_token(&signed),
         OutputFormat::File => encode_license_file(&signed),
@@ -280,7 +281,7 @@ fn inspect(input: &OsStr) -> Result<()> {
     let delegation = inspected.delegation.map(|cert| {
         serde_json::json!({
             "cert_id": hex::encode(cert.cert_id),
-            "delegate_pub": base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, cert.delegate_pub),
+            "delegate_pub": encode_signing_public_key(cert.delegate_pub),
             "product": cert.product,
             "not_before": cert.not_before,
             "not_after": cert.not_after,
@@ -306,7 +307,10 @@ fn inspect(input: &OsStr) -> Result<()> {
         "grace_secs": payload.grace_secs,
         "max_app_version": payload.max_app_version,
         "max_devices": payload.max_devices,
-        "device_pub": payload.device_pub.map(hex::encode),
+        "device_pub": payload.device_pub.map(|key| match key {
+            PublicKey::Ed25519(bytes) => hex::encode(bytes),
+            _ => encode_signing_public_key(key),
+        }),
         "device_hint": payload.device_hint.map(hex::encode),
         "tags": payload.tags.map(|tags| tags.map(hex::encode)),
         "unlock_features": payload.unlock.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
@@ -320,7 +324,7 @@ fn inspect(input: &OsStr) -> Result<()> {
 
 fn verify(args: args::Verify) -> Result<()> {
     let trusted = read_public_keys(&args.pubkey)?;
-    let verifier = Verifier::new(&trusted, None);
+    let verifier = Verifier::with_public_keys(&trusted, None);
     let token = read_token(&args.input)?;
     let device = args
         .device_key
@@ -351,7 +355,7 @@ fn verify(args: args::Verify) -> Result<()> {
     Ok(())
 }
 
-fn read_public_keys(paths: &[std::path::PathBuf]) -> Result<Vec<(u8, [u8; 32])>> {
+fn read_public_keys(paths: &[std::path::PathBuf]) -> Result<Vec<(u8, PublicKey)>> {
     let mut public_keys = Vec::new();
     for path in paths {
         add_public_key(&mut public_keys, keys::read_master_public(path)?)?;
@@ -359,7 +363,7 @@ fn read_public_keys(paths: &[std::path::PathBuf]) -> Result<Vec<(u8, [u8; 32])>>
     Ok(public_keys)
 }
 
-fn add_public_key(keys: &mut Vec<(u8, [u8; 32])>, entry: (u8, [u8; 32])) -> Result<()> {
+fn add_public_key(keys: &mut Vec<(u8, PublicKey)>, entry: (u8, PublicKey)) -> Result<()> {
     if let Some(existing) = keys.iter().find(|(id, _)| *id == entry.0) {
         ensure!(*existing == entry, "duplicate master key ID {}", entry.0);
     } else {

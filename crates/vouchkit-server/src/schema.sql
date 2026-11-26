@@ -5,7 +5,7 @@ CREATE TABLE entitlements (
 
 CREATE TABLE activations (
     entitlement_id BLOB NOT NULL REFERENCES entitlements,
-    device_pub BLOB NOT NULL CHECK(length(device_pub) = 32),
+    device_pub BLOB NOT NULL CHECK(length(device_pub) IN (32, 33)),
     first_seen INTEGER NOT NULL,
     last_seen INTEGER NOT NULL,
     deactivated_at INTEGER,
@@ -28,7 +28,7 @@ CREATE INDEX issued_leases_by_device ON issued_leases(entitlement_id, device_pub
 
 CREATE TABLE request_nonces (
     entitlement_id BLOB NOT NULL CHECK(length(entitlement_id) = 16),
-    device_pub BLOB NOT NULL CHECK(length(device_pub) = 32),
+    device_pub BLOB NOT NULL CHECK(length(device_pub) IN (32, 33)),
     nonce BLOB NOT NULL CHECK(length(nonce) = 16),
     PRIMARY KEY(entitlement_id, device_pub, nonce)
 ) STRICT, WITHOUT ROWID;

@@ -1,7 +1,13 @@
 use crate::LicenseError;
 
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-const PREFIX: &str = "VK1-";
+fn prefix(bytes: &[u8]) -> &'static str {
+    if bytes.first() == Some(&2) {
+        "VK2-"
+    } else {
+        "VK1-"
+    }
+}
 const BEGIN: &str = "-----BEGIN VOUCHKIT LICENSE-----";
 const END: &str = "-----END VOUCHKIT LICENSE-----";
 pub(crate) const MAX_TOKEN_BYTES: usize = 1_100;
@@ -24,7 +30,7 @@ fn symbols(bytes: &[u8]) -> impl Iterator<Item = u8> + '_ {
 
 /// Encodes binary license data as grouped, unpadded Crockford Base32.
 pub fn encode_token(bytes: &[u8]) -> String {
-    let mut out = String::from(PREFIX);
+    let mut out = String::from(prefix(bytes));
     for (index, value) in symbols(bytes).enumerate() {
         if index != 0 && index % 5 == 0 {
             out.push('-');
@@ -37,7 +43,7 @@ pub fn encode_token(bytes: &[u8]) -> String {
 /// Encodes binary license data as a labeled and line-wrapped license document.
 pub fn encode_license_file(bytes: &[u8]) -> String {
     let mut out = format!("{BEGIN}\n");
-    for (index, value) in PREFIX.bytes().chain(symbols(bytes)).enumerate() {
+    for (index, value) in prefix(bytes).bytes().chain(symbols(bytes)).enumerate() {
         if index != 0 && index % 64 == 0 {
             out.push('\n');
         }
@@ -65,12 +71,11 @@ pub fn decode_token(text: &str) -> Result<Vec<u8>, LicenseError> {
         text
     };
     let mut symbols = text.chars().filter(|ch| *ch != '-' && !ch.is_whitespace());
-    if !matches!(
-        (symbols.next(), symbols.next(), symbols.next()),
-        (Some('V' | 'v'), Some('K' | 'k'), Some('1'))
-    ) {
-        return Err(LicenseError::Malformed);
-    }
+    let version = match (symbols.next(), symbols.next(), symbols.next()) {
+        (Some('V' | 'v'), Some('K' | 'k'), Some('1')) => 1,
+        (Some('V' | 'v'), Some('K' | 'k'), Some('2')) => 2,
+        _ => return Err(LicenseError::Malformed),
+    };
     let mut output = Vec::new();
     let mut remaining = 0u8;
     let mut accumulator = 0u16;
@@ -97,7 +102,10 @@ pub fn decode_token(text: &str) -> Result<Vec<u8>, LicenseError> {
             }
         }
     }
-    if accumulator != 0 || output.is_empty() || count != (output.len() * 8).div_ceil(5) {
+    if accumulator != 0
+        || output.first() != Some(&version)
+        || count != (output.len() * 8).div_ceil(5)
+    {
         return Err(LicenseError::Malformed);
     }
     Ok(output)

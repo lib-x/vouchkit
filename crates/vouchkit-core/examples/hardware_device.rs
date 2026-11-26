@@ -1,11 +1,13 @@
-//! Adapt an Ed25519-capable USB dongle or HSM through a key handle or vendor session.
+//! Adapt an Ed25519- or P-256-capable USB dongle or HSM through a key handle or vendor session.
 
 use std::error::Error;
 
-use vouchkit_core::{DeviceKeyError, DeviceProver, SigningKey};
+use vouchkit_core::{
+    DeviceKeyError, DeviceProver, PublicKey, SigningAlgorithm, SigningProvider, SoftwareSigningKey,
+};
 
 struct DeviceSigner<F> {
-    public_key: [u8; 32],
+    public_key: PublicKey,
     sign_with_device: F,
 }
 
@@ -13,7 +15,7 @@ impl<F> DeviceProver for DeviceSigner<F>
 where
     F: Fn(&[u8]) -> Result<[u8; 64], DeviceKeyError>,
 {
-    fn public(&self) -> [u8; 32] {
+    fn public(&self) -> PublicKey {
         self.public_key
     }
 
@@ -35,10 +37,13 @@ fn sign_with(prover: &dyn DeviceProver) -> Result<(), DeviceKeyError> {
 fn main() -> Result<(), Box<dyn Error>> {
     // The demo stays runnable on machines with no hardware. A real integration
     // supplies the registered public key and a callback to its vendor session.
-    let demo = SigningKey::from_seed(&[7; 32]);
+    let demo = SoftwareSigningKey::from_seed(SigningAlgorithm::P256, &[7; 32])?;
     let device = DeviceSigner {
-        public_key: demo.public(),
-        sign_with_device: |message: &[u8]| Ok(demo.sign(message)),
+        public_key: demo.public_key(),
+        sign_with_device: |message: &[u8]| {
+            demo.try_sign(message)
+                .map_err(|_| DeviceKeyError::SigningFailed)
+        },
     };
     sign_with(&device)?;
     Ok(())

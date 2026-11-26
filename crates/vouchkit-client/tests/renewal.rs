@@ -9,8 +9,8 @@ use vouchkit_core::protocol::{
 };
 use vouchkit_core::{
     Class, Crl, DelegationCert, DeviceProver, FeatureSlots, LicenseError, LicensePayload,
-    LicenseState, SigningKey, StateStore, Verifier, VerifyOutcome, encode_token, sign_crl,
-    sign_delegation, sign_lease, sign_master,
+    LicenseState, PublicKey, SigningAlgorithm, SigningKey, StateStore, Verifier, VerifyOutcome,
+    encode_token, sign_crl, sign_delegation, sign_lease, sign_master,
 };
 
 const KEY_ID: u8 = 19;
@@ -41,7 +41,7 @@ impl Fixture {
             &master,
             &DelegationCert {
                 cert_id: [9; 16],
-                delegate_pub: delegate.public(),
+                delegate_pub: delegate.public().into(),
                 product: PRODUCT.to_owned(),
                 not_before: 900,
                 not_after: 4_000,
@@ -143,6 +143,7 @@ impl Fixture {
 struct MockTransport {
     activation: Option<LeaseResponse>,
     renewal: Option<Result<LeaseResponse, TransportError>>,
+    renewal_key: Option<PublicKey>,
     crl: Option<Vec<u8>>,
     renew_count: AtomicUsize,
 }
@@ -158,12 +159,20 @@ impl MockTransport {
 
 #[async_trait]
 impl Transport for MockTransport {
-    async fn activate(&self, _: &ActivateRequest) -> Result<LeaseResponse, TransportError> {
+    async fn activate(&self, request: &ActivateRequest) -> Result<LeaseResponse, TransportError> {
+        request
+            .verify_proof(ENTITLEMENT)
+            .map_err(|_| TransportError::Rejected(ErrorCode::DeviceProofFailed))?;
         self.activation.clone().ok_or(TransportError::Unavailable)
     }
 
-    async fn renew(&self, _: &RenewRequest) -> Result<LeaseResponse, TransportError> {
+    async fn renew(&self, request: &RenewRequest) -> Result<LeaseResponse, TransportError> {
         self.renew_count.fetch_add(1, Ordering::Relaxed);
+        if let Some(key) = self.renewal_key {
+            request
+                .verify_proof(ENTITLEMENT, key)
+                .map_err(|_| TransportError::Rejected(ErrorCode::DeviceProofFailed))?;
+        }
         self.renewal
             .clone()
             .unwrap_or(Err(TransportError::Unavailable))
@@ -179,6 +188,50 @@ impl Transport for MockTransport {
     async fn fetch_crl(&self) -> Result<Option<Vec<u8>>, TransportError> {
         Ok(self.crl.clone())
     }
+}
+
+#[tokio::test]
+async fn p256_device_activates_and_renews_with_an_ed25519_delegate_after_restart() -> TestResult {
+    let mut fixture = Fixture::new()?;
+    let app_data = tempfile::tempdir()?;
+    let path = app_data.path().join("device.key");
+    fixture.device = DeviceKey::open_or_create_file_with_algorithm(&path, SigningAlgorithm::P256)?;
+    let public = fixture.device.public();
+    let due = FIRST + DUR / 2;
+    let mut transport = MockTransport::activation(fixture.lease(FIRST, 2, |_| {})?);
+    transport.renewal = Some(Ok(fixture.lease(due, 3, |_| {})?));
+    transport.renewal_key = Some(public);
+    let store_path = app_data.path().join("license.state");
+    {
+        let mut store = FileStateStore::open(&store_path)?;
+        let outcome = fixture
+            .client()?
+            .activate(
+                FIRST,
+                &fixture.entitlement()?,
+                &transport,
+                &mut store,
+                &fixture.device,
+            )
+            .await?;
+        assert_eq!(
+            outcome
+                .license()
+                .and_then(|license| license.payload().device_pub),
+            Some(public)
+        );
+    }
+    let device = DeviceKey::load_file(path)?;
+    let mut store = FileStateStore::open(store_path)?;
+    let renewed = fixture
+        .client()?
+        .renew_if_needed(due, &transport, &mut store, &device)
+        .await?;
+    assert!(matches!(
+        renewed,
+        Renewal::Renewed(VerifyOutcome::Active(_))
+    ));
+    Ok(())
 }
 
 #[tokio::test]

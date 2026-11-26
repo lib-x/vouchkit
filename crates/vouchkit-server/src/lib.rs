@@ -1,9 +1,12 @@
-//! Optional HTTP activation with SQLite-backed seats and delegated lease signing.
+//! Optional online activation and delegated lease signing with pluggable storage.
 
 mod config;
+#[cfg(feature = "sqlite")]
 mod db;
 mod http;
+mod memory;
 mod rate_limit;
+mod store;
 
 use std::{
     path::Path,
@@ -12,12 +15,11 @@ use std::{
 };
 
 use axum::Router;
-use rusqlite::{Connection, Transaction, TransactionBehavior};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use vouchkit_core::{
-    AppVersion, Class, Crl, DelegationCert, Ed25519Signer, Id, LicenseError, LicensePayload,
-    SignedLicense, Verifier, decode_token, encode_token,
+    AppVersion, Class, Crl, DelegationCert, Id, LicenseError, LicensePayload, SignedLicense,
+    SigningProvider, Verifier, decode_token, encode_token,
     protocol::{ActivateRequest, DeactivateRequest, LeaseResponse, RenewRequest},
     random_bytes, sign_lease,
 };
@@ -25,12 +27,19 @@ use zeroize::Zeroizing;
 
 pub use config::ServerConfig;
 use config::{DAY_SECS, MAX_CRL_BYTES, is_missing, read_limited};
-use db::Device;
+#[cfg(feature = "sqlite")]
+pub use db::SqliteActivationStore;
+pub use memory::MemoryActivationStore;
 use rate_limit::{Limits, lock};
+pub use store::{
+    ActivationStore, ActivationTransaction, DeviceIdentity, Registration, StoreError, StoredCrl,
+    TransactionControl, TransactionMode,
+};
 
 const MAX_PENDING_REQUESTS: usize = 32;
 const EXPIRY_WARNING_DAYS: u64 = 14;
-const MAX_SQLITE_TIMESTAMP: u64 = i64::MAX.unsigned_abs();
+const CLOCK_SKEW_SECS: u64 = 300;
+const MAX_LEASE_TIMESTAMP: u64 = i64::MAX.unsigned_abs();
 
 /// A configuration, storage, or delegated issuance failure.
 #[derive(Debug, Error)]
@@ -42,9 +51,9 @@ pub enum ServerError {
     /// Required settings could not be applied.
     #[error("{0}")]
     Config(&'static str),
-    /// SQLite rejected an activation state operation.
-    #[error("activation database operation failed")]
-    Database(#[from] rusqlite::Error),
+    /// An activation transaction or its backend failed.
+    #[error(transparent)]
+    Storage(#[from] StoreError),
     /// The license or its proof did not satisfy server policy.
     #[error(transparent)]
     License(#[from] LicenseError),
@@ -82,50 +91,76 @@ impl std::fmt::Debug for ActivationServer {
 
 struct Inner {
     verifier: Verifier,
-    delegate: Box<dyn Ed25519Signer + Send + Sync>,
+    delegate: Box<dyn SigningProvider + Send + Sync>,
     cert_key_id: u8,
     cert: DelegationCert,
     cert_bytes: Vec<u8>,
     lease_secs: u64,
     grace_secs: u32,
-    storage: Mutex<Storage>,
+    store: Box<dyn ActivationStore>,
+    crl_cache: Mutex<Option<Arc<Crl>>>,
     limits: Limits,
     http_slots: Arc<Semaphore>,
 }
 
-struct Storage {
-    conn: Connection,
-    crl: Option<Crl>,
-}
-
 impl ActivationServer {
-    /// Opens the SQLite state and validates the delegate's author-signed certificate.
+    /// Opens the reference SQLite backend with the configured signing key.
     ///
     /// # Errors
     ///
-    /// Returns an error if any key, certificate, rate limit, CRL or database is invalid.
+    /// Returns an error if the files, backend, key, certificate or limits are invalid.
+    #[cfg(feature = "sqlite")]
     pub fn load(config: &ServerConfig) -> Result<Self, ServerError> {
         Self::load_with_delegate(config, config.read_delegate()?)
     }
 
-    /// Opens the service with a caller-provided Ed25519 delegate signing provider.
-    ///
-    /// The provider owns private-key custody and is called on a blocking worker.
-    /// Supply a provider with bounded signing latency to protect concurrent issuance.
-    /// The local delegate file and environment settings are unused with this constructor.
+    /// Opens the reference SQLite backend with a caller-provided signer.
     ///
     /// # Errors
     ///
-    /// Returns an error if the provider's public key differs from the signed certificate
-    /// or if the configured trust roots, certificate, limits or database are invalid.
+    /// Returns an error if SQLite, the signer, or the configured files are invalid.
+    #[cfg(feature = "sqlite")]
     pub fn load_with_delegate(
         config: &ServerConfig,
-        delegate: impl Ed25519Signer + Send + Sync + 'static,
+        delegate: impl SigningProvider + Send + Sync + 'static,
     ) -> Result<Self, ServerError> {
-        let verifier = Verifier::new(&config.read_master_keys()?, None);
+        Self::load_with_store_and_delegate(
+            config,
+            SqliteActivationStore::open(&config.database)?,
+            delegate,
+        )
+    }
+
+    /// Uses the given storage backend and the signing key configured on disk or in the environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend, files, key, certificate or limits are invalid.
+    pub fn load_with_store(
+        config: &ServerConfig,
+        store: impl ActivationStore + 'static,
+    ) -> Result<Self, ServerError> {
+        Self::load_with_store_and_delegate(config, store, config.read_delegate()?)
+    }
+
+    /// Uses caller-owned implementations of activation storage and signing custody.
+    ///
+    /// Configure bounded signing latency. Issuing a lease signs within the same
+    /// atomic transaction that checks seats, the clock and revocation state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the signing key differs from the signed certificate or
+    /// the configured trust roots, files, limits or storage state are invalid.
+    pub fn load_with_store_and_delegate(
+        config: &ServerConfig,
+        store: impl ActivationStore + 'static,
+        delegate: impl SigningProvider + Send + Sync + 'static,
+    ) -> Result<Self, ServerError> {
+        let verifier = Verifier::with_public_keys(&config.read_master_keys()?, None);
         let cert_bytes = read_limited(&config.delegation_cert, 512)?;
         let (cert_key_id, cert) = verifier.verify_delegation(&cert_bytes)?;
-        if cert.delegate_pub != delegate.public() {
+        if cert.delegate_pub != delegate.public_key() {
             return Err(ServerError::Config(
                 "delegate private key does not match delegation certificate",
             ));
@@ -140,9 +175,6 @@ impl ActivationServer {
             ));
         }
 
-        let conn = db::open(&config.database)?;
-        let crl = load_stored_crl(&conn, &verifier)?;
-        let has_crl = crl.is_some();
         let server = Self {
             inner: Arc::new(Inner {
                 verifier,
@@ -152,7 +184,8 @@ impl ActivationServer {
                 cert_bytes,
                 lease_secs: config.lease_secs,
                 grace_secs: config.grace_secs,
-                storage: Mutex::new(Storage { conn, crl }),
+                store: Box::new(store),
+                crl_cache: Mutex::new(None),
                 limits: Limits::new(
                     config.requests_per_ip_per_minute,
                     config.requests_per_entitlement_per_minute,
@@ -161,7 +194,9 @@ impl ActivationServer {
                 http_slots: Arc::new(Semaphore::new(MAX_PENDING_REQUESTS)),
             }),
         };
-
+        let has_crl = server.inner.state_operation(TransactionMode::Read, |tx| {
+            Ok(server.inner.current_crl(tx)?.is_some())
+        })?;
         if let Some(path) = &config.crl {
             if has_crl && is_missing(path)? {
                 tracing::warn!(
@@ -180,12 +215,12 @@ impl ActivationServer {
     ///
     /// ```no_run
     /// use std::{net::SocketAddr, path::Path};
-    /// use vouchkit_server::{ActivationServer, ServerConfig};
+    /// use vouchkit_server::{ActivationServer, MemoryActivationStore, ServerConfig};
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let config = ServerConfig::load(Path::new("config.toml"))?;
-    /// let service = ActivationServer::load(&config)?;
+    /// let service = ActivationServer::load_with_store(&config, MemoryActivationStore::new())?;
     /// let listener = tokio::net::TcpListener::bind(config.listen()).await?;
     /// axum::serve(
     ///     listener,
@@ -220,30 +255,24 @@ impl ActivationServer {
         if crl.seq == 0 {
             return Err(LicenseError::Malformed.into());
         }
-        let mut storage = lock(&self.inner.storage)?;
-        let tx = storage
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        if let Some(stored_seq) = db::stored_crl_seq(&tx)? {
-            match crl.seq.cmp(&u64::from_be_bytes(stored_seq)) {
-                std::cmp::Ordering::Less => return Err(LicenseError::CrlRollback.into()),
-                std::cmp::Ordering::Equal => {
-                    let same = db::stored_crl(&tx)?.as_deref() == Some(bytes);
-                    return if same {
-                        Ok(false)
-                    } else {
-                        Err(ServerError::CrlConflict)
-                    };
+        self.inner.state_operation(TransactionMode::Write, |tx| {
+            if let Some(current) = self.inner.current_crl(tx)? {
+                match crl.seq.cmp(&current.seq) {
+                    std::cmp::Ordering::Less => return Err(LicenseError::CrlRollback.into()),
+                    std::cmp::Ordering::Equal => {
+                        let same = tx.crl()?.is_some_and(|stored| stored.bytes == bytes);
+                        return if same {
+                            Ok(false)
+                        } else {
+                            Err(ServerError::CrlConflict)
+                        };
+                    }
+                    std::cmp::Ordering::Greater => {}
                 }
-                std::cmp::Ordering::Greater => {}
             }
-        }
-
-        db::store_crl(&tx, crl.seq, bytes)?;
-        tx.commit()?;
-        storage.crl = Some(crl);
-        Ok(true)
+            tx.set_crl(crl.seq, bytes)?;
+            Ok(true)
+        })
     }
 
     /// Logs a warning when the certificate needs operator attention.
@@ -263,75 +292,100 @@ impl ActivationServer {
         Ok(())
     }
 
-    fn activate(&self, request: &ActivateRequest) -> Result<LeaseResponse, ServerError> {
+    /// Verifies an activation proof, reserves a seat and issues a signed lease.
+    ///
+    /// The router applies TCP peer limits before calling this method. Embedders
+    /// accepting requests through another transport can limit callers there.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid credentials, unavailable seats or state failures.
+    pub fn activate(&self, request: &ActivateRequest) -> Result<LeaseResponse, ServerError> {
         let purchase = self.inner.entitlement(&request.entitlement_token)?;
         let entitlement_id = purchase.payload().entitlement_id;
         request.verify_proof(entitlement_id)?;
-        let device = Device {
+        let device = DeviceIdentity {
             entitlement_id,
-            public: request.device_pub,
+            public_key: request.device_pub,
         };
         self.inner
-            .run_request(&device, request.nonce, |tx, context| {
+            .run_request(device, request.nonce, |tx, context| {
                 self.inner
                     .check_entitlement(&purchase, request.app_version, &context)?;
-                if let Some(stored) = db::entitlement(tx, entitlement_id)?
+                if let Some(stored) = tx.entitlement(entitlement_id)?.map(Zeroizing::new)
                     && stored.as_slice() != purchase.bytes()
                 {
                     return Err(LicenseError::Malformed.into());
                 }
                 let max_devices = u64::from(purchase.payload().max_devices);
-                if db::active_version(tx, &device)?.is_none()
-                    && db::active_devices(tx, entitlement_id)? >= max_devices
+                if tx.registration(device)?.is_none()
+                    && tx.active_devices(entitlement_id)? >= max_devices
                 {
                     return Err(LicenseError::SeatLimit.into());
                 }
 
                 let issued = self
                     .inner
-                    .issue(&purchase, &device, request.device_hint, &context)?;
-                db::store_entitlement(tx, entitlement_id, purchase.bytes())?;
-                db::activate(
-                    tx,
-                    &device,
-                    request.app_version,
-                    request.device_hint,
+                    .issue(&purchase, device, request.device_hint, &context)?;
+                tx.insert_entitlement(entitlement_id, purchase.bytes())?;
+                tx.activate(
+                    device,
+                    Registration {
+                        app_version: request.app_version,
+                        device_hint: request.device_hint,
+                    },
                     context.now,
                 )?;
-                db::register_lease(tx, &device, issued.id, issued.accepted_until, context.now)?;
+                tx.register_lease(device, issued.id, issued.accepted_until, context.now)?;
                 Ok(issued.response)
             })
     }
 
-    fn renew(&self, request: &RenewRequest) -> Result<LeaseResponse, ServerError> {
+    /// Authenticates the lease and its device before signing a renewal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the original lease or purchase is no longer usable.
+    pub fn renew(&self, request: &RenewRequest) -> Result<LeaseResponse, ServerError> {
         let lease = self.inner.lease(&request.lease_token)?;
         let claims = lease.payload();
-        let device = Device {
+        let device = DeviceIdentity {
             entitlement_id: claims.entitlement_id,
-            public: claims.device_pub.ok_or(LicenseError::Malformed)?,
+            public_key: claims.device_pub.ok_or(LicenseError::Malformed)?,
         };
-        request.verify_proof(device.entitlement_id, device.public)?;
+        request.verify_proof(device.entitlement_id, device.public_key)?;
 
         self.inner
-            .run_request(&device, request.nonce, |tx, context| {
+            .run_request(device, request.nonce, |tx, context| {
                 lease.check_revocation(context.crl)?;
                 check_lease_time(claims, context.now)?;
-                db::require_registered_lease(tx, &device, claims.license_id)?;
-                let version = db::active_version(tx, &device)?.ok_or(LicenseError::Deactivated)?;
-                let source =
-                    db::entitlement(tx, device.entitlement_id)?.ok_or(LicenseError::Deactivated)?;
+                if !tx.has_lease(device, claims.license_id)? {
+                    return Err(LicenseError::Deactivated.into());
+                }
+                let registration = tx.registration(device)?.ok_or(LicenseError::Deactivated)?;
+                let source = tx
+                    .entitlement(device.entitlement_id)?
+                    .map(Zeroizing::new)
+                    .ok_or(LicenseError::Deactivated)?;
                 let purchase = self.inner.verifier.authenticate(&source)?;
-                self.inner.check_entitlement(&purchase, version, &context)?;
+                self.inner
+                    .check_entitlement(&purchase, registration.app_version, &context)?;
 
-                let hint = db::device_hint(tx, &device)?;
-                let issued = self.inner.issue(&purchase, &device, hint, &context)?;
-                db::touch(tx, &device, context.now)?;
-                db::register_lease(tx, &device, issued.id, issued.accepted_until, context.now)?;
+                let issued =
+                    self.inner
+                        .issue(&purchase, device, registration.device_hint, &context)?;
+                tx.touch(device, context.now)?;
+                tx.register_lease(device, issued.id, issued.accepted_until, context.now)?;
                 Ok(issued.response)
             })
     }
 
-    fn deactivate(&self, request: &DeactivateRequest) -> Result<(), ServerError> {
+    /// Authenticates the caller's device and frees its seat.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid credentials, proofs or storage state.
+    pub fn deactivate(&self, request: &DeactivateRequest) -> Result<(), ServerError> {
         let token = match (&request.lease_token, &request.entitlement_token) {
             (Some(token), None) => self.inner.lease(token)?,
             (None, Some(token)) => self.inner.entitlement(token)?,
@@ -342,57 +396,63 @@ impl ActivationServer {
         if claims.class == Class::Lease && claims.device_pub != Some(request.device_pub) {
             return Err(LicenseError::DeviceProofFailed.into());
         }
-        let device = Device {
+        let device = DeviceIdentity {
             entitlement_id: claims.entitlement_id,
-            public: request.device_pub,
+            public_key: request.device_pub,
         };
         request.verify_proof(device.entitlement_id)?;
 
         self.inner
-            .run_request(&device, request.nonce, |tx, context| {
+            .run_request(device, request.nonce, |tx, context| {
                 token.check_revocation(context.crl)?;
                 if claims.class == Class::Lease {
-                    if db::active_version(tx, &device)?.is_none() {
+                    if tx.registration(device)?.is_none() {
                         return Ok(());
                     }
-                    db::require_registered_lease(tx, &device, claims.license_id)?;
-                } else if let Some(stored) = db::entitlement(tx, device.entitlement_id)?
+                    if !tx.has_lease(device, claims.license_id)? {
+                        return Err(LicenseError::Deactivated.into());
+                    }
+                } else if let Some(stored) =
+                    tx.entitlement(device.entitlement_id)?.map(Zeroizing::new)
                     && stored.as_slice() != token.bytes()
                 {
                     return Err(LicenseError::Malformed.into());
                 }
-                db::deactivate(tx, &device, context.now)
+                tx.deactivate(device, context.now)?;
+                Ok(())
             })
     }
 
     fn crl(&self) -> Result<Option<Vec<u8>>, ServerError> {
-        let storage = lock(&self.inner.storage)?;
-        db::stored_crl(&storage.conn)
+        self.inner.state_operation(TransactionMode::Read, |tx| {
+            self.inner.current_crl(tx)?;
+            Ok(tx.crl()?.map(|stored| stored.bytes))
+        })
     }
 
     fn health(&self) -> Result<http::Health, ServerError> {
-        let storage = lock(&self.inner.storage)?;
-        let now = unix_now()?;
-        let last = db::last_time(&storage.conn)?;
-        let clock_good = now.saturating_add(db::CLOCK_SKEW_SECS) >= last;
-        let now = now.max(last);
-        let remaining = self.inner.cert.not_after.saturating_sub(now);
-        let crl = current_crl(&storage.conn, &self.inner.verifier, storage.crl.as_ref())?;
-        let crl = crl.as_ref().or(storage.crl.as_ref());
-        let status = if !clock_good {
-            "clock_rollback"
-        } else if now < self.inner.cert.not_before {
-            "certificate_not_yet_valid"
-        } else if now > self.inner.cert.not_after {
-            "certificate_expired"
-        } else if self.inner.cert_revoked(crl, now) {
-            "certificate_revoked"
-        } else {
-            "ok"
-        };
-        Ok(http::Health {
-            status,
-            certificate_remaining_days: remaining.div_ceil(DAY_SECS),
+        self.inner.state_operation(TransactionMode::Read, |tx| {
+            let now = unix_now()?;
+            let last = tx.last_seen_time()?;
+            let clock_good = now.saturating_add(CLOCK_SKEW_SECS) >= last;
+            let now = now.max(last);
+            let remaining = self.inner.cert.not_after.saturating_sub(now);
+            let crl = self.inner.current_crl(tx)?;
+            let status = if !clock_good {
+                "clock_rollback"
+            } else if now < self.inner.cert.not_before {
+                "certificate_not_yet_valid"
+            } else if now > self.inner.cert.not_after {
+                "certificate_expired"
+            } else if self.inner.cert_revoked(crl.as_deref(), now) {
+                "certificate_revoked"
+            } else {
+                "ok"
+            };
+            Ok(http::Health {
+                status,
+                certificate_remaining_days: remaining.div_ceil(DAY_SECS),
+            })
         })
     }
 }
@@ -418,40 +478,131 @@ impl Inner {
         Ok(signed)
     }
 
+    fn transact<T>(
+        &self,
+        mode: TransactionMode,
+        operation: impl FnOnce(
+            &mut dyn ActivationTransaction,
+        ) -> (TransactionControl, Result<T, ServerError>),
+    ) -> Result<T, ServerError> {
+        let mut operation = Some(operation);
+        let mut outcome =
+            Err(StoreError::InvalidState("activation store omitted its callback").into());
+        self.store.transaction(mode, &mut |tx| {
+            let Some(operation) = operation.take() else {
+                outcome =
+                    Err(StoreError::InvalidState("activation store repeated its callback").into());
+                return TransactionControl::Rollback;
+            };
+            let (control, result) = operation(tx);
+            outcome = result;
+            control
+        })?;
+        outcome
+    }
+
+    fn state_operation<T>(
+        &self,
+        mode: TransactionMode,
+        operation: impl FnOnce(&mut dyn ActivationTransaction) -> Result<T, ServerError>,
+    ) -> Result<T, ServerError> {
+        self.transact(mode, |tx| {
+            let outcome = operation(tx);
+            let control = if outcome.is_ok() {
+                TransactionControl::Commit
+            } else {
+                TransactionControl::Rollback
+            };
+            (control, outcome)
+        })
+    }
+
+    fn current_crl(&self, tx: &dyn ActivationTransaction) -> Result<Option<Arc<Crl>>, ServerError> {
+        let stored = tx.crl_sequence()?;
+        if stored.is_none() && tx.crl()?.is_some() {
+            return Err(
+                StoreError::InvalidState("missing sequence for stored revocation list").into(),
+            );
+        }
+        let mut cache = lock(&self.crl_cache)?;
+        let cached = cache.as_ref().map(|crl| crl.seq);
+        match stored.cmp(&cached) {
+            std::cmp::Ordering::Less => Err(LicenseError::CrlRollback.into()),
+            std::cmp::Ordering::Equal => Ok(cache.clone()),
+            std::cmp::Ordering::Greater => {
+                let raw = tx
+                    .crl()?
+                    .ok_or(StoreError::InvalidState("missing stored revocation bytes"))?;
+                let crl = self.verifier.verify_crl(&raw.bytes)?;
+                if Some(raw.sequence) != stored || raw.sequence != crl.seq {
+                    return Err(ServerError::CrlConflict);
+                }
+                let crl = Arc::new(crl);
+                *cache = Some(Arc::clone(&crl));
+                Ok(Some(crl))
+            }
+        }
+    }
+
     fn run_request<T>(
         &self,
-        device: &Device,
+        device: DeviceIdentity,
         nonce: Id,
-        business: impl FnOnce(&Transaction<'_>, RequestContext<'_>) -> Result<T, ServerError>,
+        business: impl FnOnce(
+            &mut dyn ActivationTransaction,
+            RequestContext<'_>,
+        ) -> Result<T, ServerError>,
     ) -> Result<T, ServerError> {
         self.limits.check_entitlement(device.entitlement_id)?;
-        let mut storage = lock(&self.storage)?;
-        let Storage { conn, crl } = &mut *storage;
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let now = db::monotonic_time(&tx, unix_now()?)?;
-        let fresh_crl = current_crl(&tx, &self.verifier, crl.as_ref())?;
-        let context = RequestContext {
-            now,
-            crl: fresh_crl.as_ref().or(crl.as_ref()),
-        };
-        db::consume_nonce(&tx, device, nonce)?;
-        let result = business(&tx, context);
-        // Policy rejections consume the authenticated nonce. A transient signer
-        // or storage failure leaves the request eligible for an exact retry.
-        let commit = match &result {
-            Ok(_) | Err(ServerError::CertificateInactive) => true,
-            Err(ServerError::License(error)) => {
-                !matches!(error, LicenseError::Randomness | LicenseError::Signing(_))
-            }
-            Err(_) => false,
-        };
-        if commit {
-            tx.commit()?;
+        self.transact(TransactionMode::Write, |tx| {
+            let (now, crl) = match self.prepare_request(tx, device, nonce) {
+                Ok(prepared) => prepared,
+                Err(error) => return (TransactionControl::Rollback, Err(error)),
+            };
+            let result = business(
+                tx,
+                RequestContext {
+                    now,
+                    crl: crl.as_deref(),
+                },
+            );
+            // Policy rejections consume the authenticated nonce. A transient signer
+            // or storage failure leaves the request eligible for an exact retry.
+            let commit = match &result {
+                Ok(_) | Err(ServerError::CertificateInactive) => true,
+                Err(ServerError::License(error)) => {
+                    !matches!(error, LicenseError::Randomness | LicenseError::Signing(_))
+                }
+                Err(_) => false,
+            };
+            let control = if commit {
+                TransactionControl::Commit
+            } else {
+                TransactionControl::Rollback
+            };
+            (control, result)
+        })
+    }
+
+    fn prepare_request(
+        &self,
+        tx: &mut dyn ActivationTransaction,
+        device: DeviceIdentity,
+        nonce: Id,
+    ) -> Result<(u64, Option<Arc<Crl>>), ServerError> {
+        let local_now = unix_now()?;
+        let last = tx.last_seen_time()?;
+        if local_now.saturating_add(CLOCK_SKEW_SECS) < last {
+            return Err(LicenseError::ClockRollback.into());
         }
-        if let Some(fresh_crl) = fresh_crl {
-            *crl = Some(fresh_crl);
+        if local_now > last {
+            tx.set_last_seen_time(local_now)?;
         }
-        result
+        let crl = self.current_crl(tx)?;
+        if !tx.insert_nonce(device, nonce)? {
+            return Err(LicenseError::Replay.into());
+        }
+        Ok((local_now.max(last), crl))
     }
 
     fn check_entitlement(
@@ -502,7 +653,7 @@ impl Inner {
     fn issue(
         &self,
         purchase: &SignedLicense,
-        device: &Device,
+        device: DeviceIdentity,
         hint: Option<Id>,
         context: &RequestContext<'_>,
     ) -> Result<Issued, ServerError> {
@@ -537,7 +688,7 @@ impl Inner {
             grace_secs: times.grace_secs,
             max_app_version: claims.max_app_version,
             max_devices: 0,
-            device_pub: Some(device.public),
+            device_pub: Some(device.public_key),
             device_hint: hint,
             tags: claims.tags,
             unlock: claims.unlock.clone(),
@@ -587,8 +738,8 @@ impl LeaseTimes {
         purchase_expires: Option<u64>,
     ) -> Result<Self, LicenseError> {
         let hard_end = purchase_expires
-            .unwrap_or(MAX_SQLITE_TIMESTAMP)
-            .min(MAX_SQLITE_TIMESTAMP);
+            .unwrap_or(MAX_LEASE_TIMESTAMP)
+            .min(MAX_LEASE_TIMESTAMP);
         let expires_at = now.saturating_add(lease_secs).min(hard_end);
         if expires_at <= now {
             return Err(LicenseError::Expired);
@@ -611,32 +762,6 @@ fn check_lease_time(claims: &LicensePayload, now: u64) -> Result<(), LicenseErro
         return Err(LicenseError::Expired);
     }
     Ok(())
-}
-
-fn load_stored_crl(conn: &Connection, verifier: &Verifier) -> Result<Option<Crl>, ServerError> {
-    let Some((sequence, raw)) = db::stored_crl_snapshot(conn)? else {
-        return Ok(None);
-    };
-    let crl = verifier.verify_crl(&raw)?;
-    if sequence != crl.seq.to_be_bytes() {
-        return Err(ServerError::CrlConflict);
-    }
-    Ok(Some(crl))
-}
-
-/// Returns a freshly authenticated snapshot when another database writer changed it.
-fn current_crl(
-    conn: &Connection,
-    verifier: &Verifier,
-    cached: Option<&Crl>,
-) -> Result<Option<Crl>, ServerError> {
-    let stored = db::stored_crl_seq(conn)?.map(u64::from_be_bytes);
-    let cached = cached.map(|crl| crl.seq);
-    match (stored, cached) {
-        (Some(revision), _) if Some(revision) > cached => load_stored_crl(conn, verifier),
-        _ if stored < cached => Err(LicenseError::CrlRollback.into()),
-        _ => Ok(None),
-    }
 }
 
 fn unix_now() -> Result<u64, ServerError> {

@@ -1,6 +1,8 @@
 # vouchkit-server
 
-Reference activation server for vouchkit, running on a delegated key. Integrate it when an application needs seat limits and short-lived renewals. Apps verify signed leases locally with the author's public key and their device key.
+Reference online authorization server for vouchkit, running on a delegated key.
+Integrate it when an application needs seat limits and short-lived renewals.
+Apps verify signed leases locally with the author's public key and their device key.
 
 ## Run the server
 
@@ -21,6 +23,31 @@ files under `/config` with read access for UID 10001. Terminate HTTPS at a trust
 reverse proxy. IP limits use the direct TCP peer address. Configure per-client IP
 rate limiting at the proxy and size the backend's peer limit for aggregate traffic,
 including health checks.
+
+## Storage backends
+
+The reference binary uses SQLite with the default feature set. Build it without
+SQLite and select the process-local backend with:
+
+```sh
+cargo run -p vouchkit-server --no-default-features -- --config config.toml --storage memory
+```
+
+Memory storage supports activation, renewal, seat limits, nonces and signed CRLs
+for a single process. Restarting clears those records. Use it for development
+or deployments that deliberately accept that lifetime.
+
+An embedding application can supply an implementation of `ActivationStore`
+through `ActivationServer::load_with_store`. The backend owns durable
+state. Its write transactions must serialize seat-count predicates, activation
+mutations, nonce uniqueness, clock monotonicity and CRL versions together across
+all instances using the same state. Commit publishes every write atomically.
+Rollback discards them. Backends execute the callback once because it can
+invoke a signing provider. A read transaction uses a consistent snapshot.
+
+The SQLite feature includes the default reference store
+`SqliteActivationStore`. It migrates the original schema in one transaction,
+retaining registered device keys, lease IDs, used nonces, clock state and CRLs.
 
 ## Operations
 
@@ -57,12 +84,14 @@ which contain signed entitlements and device registration metadata. The
 transaction protects concurrent seat allocation against a single database. Separate database files have independent
 seat counts.
 
-## Custom delegated signer
+## Signing providers
 
-An embedding application can pass an `Ed25519Signer` to
-`ActivationServer::load_with_delegate`. Use it for a non-exportable Ed25519
-provider that can sign the exact protocol transcript, such as an HSM with
-Ed25519 support. The provider's public key must match `cert.bin`. Configure a
-bounded signing deadline for the provider, since signing participates in the
-atomic seat transaction. The bundled binary uses the file or environment
-configuration shown above.
+The built-in suites are Ed25519 and ECDSA P-256. An embedding application can
+inject a `SigningProvider` dynamically through
+`ActivationServer::load_with_store_and_delegate`, or through
+`ActivationServer::load_with_delegate` when using the SQLite store. A provider
+can obtain signatures from an HSM or another key service that implements one
+of those suites. Additional signature algorithms require a protocol change.
+The provider's public key must match `cert.bin`. Use a bounded signing deadline
+because signing participates in the seat transaction. The bundled binary
+loads either supported key format from the file or environment settings.

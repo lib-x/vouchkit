@@ -1,9 +1,10 @@
 use proptest::prelude::*;
 use vouchkit_core::{
-    Crl, DeviceKeyError, DeviceProver, FeatureSlots, LicenseError, LicenseState, SigningKey,
-    StateStore, TagProfile, TagSlot, Verifier, VerifyOptions, VerifyOutcome, asset_open,
-    asset_seal, check_clock_with_skew, decode_token, derive_feature_key, derive_tag_slot,
-    derive_tags, embed_pubkeys, encode_license_file, encode_token, inspect_license,
+    Crl, DeviceKeyError, DeviceProver, FeatureSlots, LicenseError, LicenseState, PublicKey,
+    SigningKey, StateStore, TagProfile, TagSlot, Verifier, VerifyOptions, VerifyOutcome,
+    asset_open, asset_seal, check_clock_with_skew, decode_token, derive_feature_key,
+    derive_tag_slot, derive_tags, embed_pubkeys, encode_license_file, encode_token,
+    inspect_license,
     protocol::{ActivateRequest, DeactivateRequest, RenewRequest},
     sign_crl, sign_delegation, sign_lease, sign_master,
 };
@@ -37,8 +38,8 @@ impl Device {
 }
 
 impl DeviceProver for Device {
-    fn public(&self) -> [u8; 32] {
-        self.key.public()
+    fn public(&self) -> PublicKey {
+        self.key.public().into()
     }
     fn sign(&self, message: &[u8]) -> Result<[u8; 64], DeviceKeyError> {
         if self.deny {
@@ -544,7 +545,7 @@ proptest! {
 
 #[test]
 fn author_provider_can_use_an_external_key_handle() -> Result<(), LicenseError> {
-    use vouchkit_core::{Ed25519Signer, SigningError};
+    use vouchkit_core::{Ed25519Signer, SigningError, SigningProvider};
 
     enum Provider {
         Available(SigningKey),
@@ -566,7 +567,8 @@ fn author_provider_can_use_an_external_key_handle() -> Result<(), LicenseError> 
     }
 
     let claims = inspect_license(STANDALONE)?.payload;
-    let external = Provider::Available(SigningKey::from_seed(&[17; 32]));
+    let external: Box<dyn SigningProvider + Send + Sync> =
+        Box::new(Provider::Available(SigningKey::from_seed(&[17; 32])));
     assert_eq!(sign_master(ROOT_ID, &external, &claims)?, STANDALONE);
     let external = Provider::WrongKey(SigningKey::from_seed(&[123; 32]));
     assert_eq!(

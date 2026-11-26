@@ -26,3 +26,4 @@ rustc-ice-*.txt
 # Local fuzz output
 /fuzz/artifacts/
 /fuzz/corpus/
+/testdata/__pycache__/

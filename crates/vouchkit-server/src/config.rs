@@ -7,7 +7,9 @@ use std::{
 };
 
 use serde::Deserialize;
-use vouchkit_core::{SigningKey, protocol::parse_master_public_key};
+use vouchkit_core::{
+    LicenseError, PublicKey, SigningAlgorithm, SoftwareSigningKey, protocol::parse_master_key,
+};
 use zeroize::Zeroizing;
 
 use crate::ServerError;
@@ -15,6 +17,7 @@ use crate::ServerError;
 pub(crate) const DAY_SECS: u64 = 86_400;
 pub(crate) const MAX_CRL_BYTES: usize = 256 * 1_024;
 const DELEGATE_HEADER: &[u8] = b"VOUCHKIT-DELEGATE-1\n";
+const P256_DELEGATE_HEADER: &[u8] = b"VOUCHKIT-DELEGATE-P256-2\n";
 
 /// Settings for a standalone, delegated activation service.
 #[derive(Debug, Deserialize)]
@@ -86,7 +89,7 @@ impl ServerConfig {
         self.crl.as_deref()
     }
 
-    pub(crate) fn read_master_keys(&self) -> Result<Vec<(u8, [u8; 32])>, ServerError> {
+    pub(crate) fn read_master_keys(&self) -> Result<Vec<(u8, PublicKey)>, ServerError> {
         if self.master_public_keys.is_empty() || self.master_public_keys.len() > 256 {
             return Err(ServerError::Config(
                 "configure one to 256 master public keys",
@@ -100,7 +103,7 @@ impl ServerConfig {
                 let text = std::str::from_utf8(&data).map_err(|_| {
                     ServerError::Config("master public key must use the vouch public key format")
                 })?;
-                let (id, key) = parse_master_public_key(text)?;
+                let (id, key) = parse_master_key(text)?;
                 if std::mem::replace(&mut seen[usize::from(id)], true) {
                     return Err(ServerError::Config("duplicate master key ID"));
                 }
@@ -109,7 +112,7 @@ impl ServerConfig {
             .collect()
     }
 
-    pub(crate) fn read_delegate(&self) -> Result<SigningKey, ServerError> {
+    pub(crate) fn read_delegate(&self) -> Result<SoftwareSigningKey, ServerError> {
         let bytes = match (&self.delegate_key, &self.delegate_key_env) {
             (Some(path), None) => Zeroizing::new(read_limited(path, 128)?),
             (None, Some(name)) => {
@@ -124,14 +127,18 @@ impl ServerConfig {
                 ));
             }
         };
-        let encoded = bytes
-            .strip_prefix(DELEGATE_HEADER)
-            .ok_or(ServerError::Config("invalid delegate key file header"))?;
+        let (algorithm, encoded) = if let Some(seed) = bytes.strip_prefix(DELEGATE_HEADER) {
+            (SigningAlgorithm::Ed25519, seed)
+        } else if let Some(seed) = bytes.strip_prefix(P256_DELEGATE_HEADER) {
+            (SigningAlgorithm::P256, seed)
+        } else {
+            return Err(ServerError::Config("invalid delegate key file header"));
+        };
         let encoded = encoded.strip_suffix(b"\n").unwrap_or(encoded);
         let mut seed = Zeroizing::new([0; 32]);
         hex::decode_to_slice(encoded, seed.as_mut())
             .map_err(|_| ServerError::Config("invalid delegate key seed"))?;
-        Ok(SigningKey::from_seed(&seed))
+        Ok(SoftwareSigningKey::from_seed(algorithm, &seed).map_err(LicenseError::from)?)
     }
 }
 

@@ -5,7 +5,7 @@ The `vouch` command-line tool for issuing, inspecting, verifying and revoking li
 ## Issue and verify an offline license
 
 ```sh
-cargo install vouchkit-cli
+cargo install --path crates/vouchkit-cli
 vouch keygen --kind master --key-id 1 --out-dir author
 
 vouch issue --key author/master.key.enc --class standalone \
@@ -17,9 +17,9 @@ vouch verify customer.vk --pubkey author/master.pub --product demo --app-version
 vouch inspect customer.vk
 ```
 
-Key generation prompts for a passphrase and creates `master.key.enc`, `master.pub`, and `public_keys.rs`. Keep the encrypted key and its passphrase under the author's control. For unattended use, set `--passphrase-file FILE` to an owner-only file. A final LF or CRLF in this file is ignored. On Unix the tool requires owner-only permissions for private key and passphrase files. The explicit `--insecure-plaintext` flag writes `master.key` and is convenient for disposable examples.
+Key generation prompts for a passphrase and creates `master.key.enc`, `master.pub`, and `public_keys.rs`. Keep the encrypted key and its passphrase under the author's control. For new keys, add `--algorithm p256` to select ECDSA P-256. Without this flag, `vouch` generates Ed25519 keys in the original file formats. Load generated P-256 public key constants with `Verifier::with_public_keys` in your Rust application. For unattended use, set `--passphrase-file FILE` to an owner-only file. A final LF or CRLF in this file is ignored. On Unix the tool requires owner-only permissions for private key and passphrase files. The explicit `--insecure-plaintext` flag writes `master.key` and is convenient for disposable examples.
 
-The first verification prints `Active`. An entitlement prints `NeedsActivation`. For bound licenses, `--device-key FILE` accepts a 32-byte file-based device seed. `inspect` prints unverified metadata and resource-key IDs. `verify` authenticates the signature chain and applies the CRL when `--crl FILE` is supplied. Pass a file path for real credentials to keep them out of shell history and process arguments.
+The first verification prints `Active`. An entitlement prints `NeedsActivation`. For bound licenses, `--device-key FILE` accepts the client's file-based device key. Ed25519 uses a raw 32-byte seed. P-256 uses the ASCII marker `VOUCHKIT-DEVICE-P256-2` followed by a NUL and a 32-byte scalar. `inspect` prints unverified metadata and resource-key IDs. `verify` authenticates the signature chain and applies the CRL when `--crl FILE` is supplied. Pass a file path for real credentials to keep them out of shell history and process arguments.
 
 The [offline example](examples/offline.sh) can be run with `sh examples/offline.sh` after installing `vouch`. It uses one disposable directory and an ephemeral master key.
 
@@ -37,6 +37,8 @@ vouch issue --key author/master.key.enc --class entitlement \
   --features 0x08 --feature-slots 64 --max-devices 2 \
   --format file --out purchase.vk --ledger author/issued.jsonl
 ```
+
+To issue with a P-256 delegate, add `--algorithm p256` when generating the delegate key. Master and delegate keys can use different algorithms. Ed25519 public keys keep the existing Base64 form. P-256 uses `p256:<base64>` or `<id>:p256:<base64>` for a master key. Use the tagged form with `--device-pub`.
 
 Deploy `activation/delegate.key`, `activation/cert.bin`, and `author/master.pub` to the activation service. Install the current signed CRL when one exists. The certificate's lease duration includes offline grace, and authorizes only its signed feature slots and tiers.
 

@@ -1,9 +1,22 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use tokio::net::TcpListener;
-use vouchkit_server::{ActivationServer, ServerConfig};
+use vouchkit_server::{ActivationServer, MemoryActivationStore, ServerConfig};
+
+const DEFAULT_STORAGE: &str = if cfg!(feature = "sqlite") {
+    "sqlite"
+} else {
+    "memory"
+};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Storage {
+    #[cfg(feature = "sqlite")]
+    Sqlite,
+    Memory,
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -11,6 +24,9 @@ struct Args {
     /// Path to the activation server's TOML configuration.
     #[arg(long, default_value = "config.toml")]
     config: PathBuf,
+    /// Storage backend for activation state.
+    #[arg(long, value_enum, default_value = DEFAULT_STORAGE)]
+    storage: Storage,
 }
 
 #[tokio::main]
@@ -25,7 +41,14 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let config = ServerConfig::load(&args.config)
         .with_context(|| format!("loading configuration from {}", args.config.display()))?;
-    let server = ActivationServer::load(&config)?;
+    let server = match args.storage {
+        #[cfg(feature = "sqlite")]
+        Storage::Sqlite => ActivationServer::load(&config)?,
+        Storage::Memory => {
+            tracing::warn!("memory storage is process-local and resets on restart");
+            ActivationServer::load_with_store(&config, MemoryActivationStore::new())?
+        }
+    };
     let listener = TcpListener::bind(config.listen()).await?;
     tracing::info!(listen = %listener.local_addr()?, "activation service listening");
 

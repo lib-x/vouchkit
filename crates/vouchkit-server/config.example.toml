@@ -1,4 +1,5 @@
 listen = "127.0.0.1:8080"
+# Used by the SQLite backend.
 database = "activations.sqlite3"
 
 # These files are relative to this configuration file.

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use vouchkit_core::protocol::MAX_CRL_BYTES;
-use vouchkit_core::{Class, Crl, Id, Verifier, decode_token, sign_crl};
+use vouchkit_core::{Class, Crl, Id, SigningProvider, Verifier, decode_token, sign_crl};
 use zeroize::Zeroizing;
 
 use crate::args::Revoke;
@@ -20,10 +20,9 @@ pub(crate) fn revoke(args: Revoke, passphrase: Option<&Path>) -> Result<()> {
         "specify at least one license, lease, entitlement or certificate to revoke"
     );
     let master = MasterKey::read(&args.key, passphrase)?;
-    let signing = master.signing_key();
     let mut public_keys = super::read_public_keys(&args.pubkey)?;
-    super::add_public_key(&mut public_keys, (master.id, signing.public()))?;
-    let verifier = Verifier::new(&public_keys, None);
+    super::add_public_key(&mut public_keys, (master.id, master.signing.public_key()))?;
+    let verifier = Verifier::with_public_keys(&public_keys, None);
     let mut leases = Vec::new();
     for input in &args.lease {
         let token = super::read_token(input)?;
@@ -71,7 +70,7 @@ pub(crate) fn revoke(args: Revoke, passphrase: Option<&Path>) -> Result<()> {
         payload.revoked_certs = merge_certificates(payload.revoked_certs, args.cert, since);
     }
 
-    let signed = sign_crl(master.id, &signing, &payload)?;
+    let signed = sign_crl(master.id, &master.signing, &payload)?;
     let state = PendingFile::new(&state_path, &signed)?;
     let in_place = files::normalized_target(&args.out)? == files::normalized_target(&state_path)?;
     let exported = if in_place {

@@ -6,7 +6,7 @@ use std::{
     fs, io,
     time::{SystemTime, UNIX_EPOCH},
 };
-use vouchkit_core::{Verifier, VerifyOptions, VerifyOutcome, protocol::parse_master_public_key};
+use vouchkit_core::{Verifier, VerifyOptions, VerifyOutcome, protocol::parse_master_key};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = env::args_os().skip(1).collect();
@@ -20,10 +20,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let product = product
         .to_str()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "product must be UTF-8"))?;
-    let key = parse_master_public_key(&fs::read_to_string(public_key)?)?;
+    let key = parse_master_key(&fs::read_to_string(public_key)?)?;
     let token = fs::read_to_string(license)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let verifier = Verifier::new(&[key], None);
+    let verifier = Verifier::with_public_keys(&[key], None);
     let outcome = verifier.verify(&token, &VerifyOptions::new(product, (1, 0, 0), now))?;
     match outcome {
         VerifyOutcome::NeedsActivation(_) => println!("Purchase requires activation"),

@@ -1,3 +1,5 @@
+#![cfg(feature = "sqlite")]
+
 use std::{
     fs,
     net::SocketAddr,
@@ -16,8 +18,8 @@ use tempfile::TempDir;
 use tokio::{net::TcpListener, task::JoinHandle};
 use vouchkit_core::{
     Class, Crl, DelegationCert, DeviceKeyError, DeviceProver, Ed25519Signer, FeatureSlots, Id,
-    LicenseError, LicensePayload, SigningError, SigningKey, Verifier, VerifyOptions, VerifyOutcome,
-    encode_token,
+    LicenseError, LicensePayload, PublicKey, SigningError, SigningKey, Verifier, VerifyOptions,
+    VerifyOutcome, encode_token,
     protocol::{
         ActivateRequest, ApiError, DeactivateRequest, DeactivateResponse, ErrorCode, LeaseResponse,
         RenewRequest,
@@ -39,8 +41,8 @@ impl Device {
 }
 
 impl DeviceProver for Device {
-    fn public(&self) -> [u8; 32] {
-        self.0.public()
+    fn public(&self) -> PublicKey {
+        self.0.public().into()
     }
 
     fn sign(&self, message: &[u8]) -> Result<[u8; 64], DeviceKeyError> {
@@ -73,7 +75,7 @@ impl Fixture {
         let features = FeatureSlots::try_from_ranges(&[(4, 7), (500, 510)])?;
         let cert = DelegationCert {
             cert_id: [56; 16],
-            delegate_pub: delegate.public(),
+            delegate_pub: delegate.public().into(),
             product: PRODUCT.into(),
             not_before: now.saturating_sub(60),
             not_after: now + 86_400,

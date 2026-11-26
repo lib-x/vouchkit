@@ -6,8 +6,8 @@ offline issuance and verification can depend directly on `vouchkit-core`.
 
 ```toml
 [dependencies]
-vouchkit-core = "0.1"
-vouchkit-client = { version = "0.1", features = ["reqwest"] }
+vouchkit-core = "0.2"
+vouchkit-client = { version = "0.2", features = ["reqwest"] }
 ```
 
 Load the application’s embedded publisher keys and its private state directory,
@@ -56,10 +56,17 @@ async fn update_license(
   belongs in a private directory. Offline revocation reflects the most recent
   signed CRL the device has received. Call `refresh_crl` to refresh it outside
   the renewal schedule.
-- The default device-key file stores a 32-byte Ed25519 seed with Unix mode 0600.
-  The `keyring` feature uses the system credential store on Linux, macOS and
-  Windows. For keys that must stay in hardware, implement
-  `vouchkit_core::DeviceProver` using your platform’s Ed25519 signing handle.
+- Device keys use Ed25519 by default. The file and system keyring also support
+  P-256 in this development version. Use
+  `DeviceKey::open_or_create_file_with_algorithm(path, SigningAlgorithm::P256)`
+  or the equivalent keyring constructor to select it explicitly. Key files use
+  Unix mode 0600. Existing raw 32-byte Ed25519 keys remain readable. Explicitly
+  asking for a different algorithm returns an error and preserves the file or
+  keyring entry.
+- The `keyring` feature uses the system credential store on Linux, macOS and
+  Windows. To keep a private key in hardware, implement
+  `vouchkit_core::DeviceProver` using your platform’s Ed25519 or P-256 signing
+  handle.
 - The `reqwest` feature supplies the HTTPS transport. Custom integrations can
   implement `Transport`. Authorization is enforced through signatures and
   device proof. The transport also protects the privacy of requests and responses.

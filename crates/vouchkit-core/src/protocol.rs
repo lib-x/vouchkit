@@ -4,11 +4,11 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD},
 };
-use ed25519_dalek::Signature;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 
 use crate::{
-    AppVersion, DeviceProver, Id, LicenseError, decode_token, random_bytes, wire::public_key,
+    AppVersion, DeviceProver, Id, LicenseError, PublicKey, SigningAlgorithm, decode_token,
+    random_bytes, wire::public_key,
 };
 
 /// Maximum allowed binary size of a signed revocation list.
@@ -16,6 +16,7 @@ pub const MAX_CRL_BYTES: usize = crate::wire::MAX_CRL_BYTES;
 /// Maximum allowed response or request size for activation JSON.
 pub const MAX_JSON_BYTES: usize = 8_192;
 const PROOF_DOMAIN: &[u8] = b"vouchkit-activate-v1\0";
+const PROOF_DOMAIN_V2: &[u8] = b"vouchkit-activate-v2\0";
 
 fn serialize_bytes<const N: usize, S: Serializer>(
     value: &[u8; N],
@@ -94,6 +95,72 @@ pub fn parse_master_public_key(text: &str) -> Result<(u8, [u8; 32]), LicenseErro
     ))
 }
 
+/// Reads a legacy Ed25519 key or an explicitly tagged P-256 public key.
+///
+/// # Errors
+///
+/// Returns an error for invalid encodings, unsupported algorithms or malformed keys.
+pub fn parse_signing_public_key(text: &str) -> Result<PublicKey, LicenseError> {
+    let text = text.trim();
+    if let Some(encoded) = text.strip_prefix("p256:") {
+        if encoded.len() != 44 {
+            return Err(LicenseError::Malformed);
+        }
+        let bytes = STANDARD_NO_PAD
+            .decode(encoded)
+            .map_err(|_| LicenseError::Malformed)?;
+        PublicKey::from_p256_sec1(&bytes)
+    } else if text.contains(':') {
+        Err(LicenseError::UnsupportedAlgorithm)
+    } else {
+        decode_public_key(text).map(PublicKey::from)
+    }
+}
+
+/// Encodes a canonical public key in the author and delegate file format.
+pub fn encode_signing_public_key(key: PublicKey) -> String {
+    let raw = STANDARD_NO_PAD.encode(key.as_bytes());
+    match key {
+        PublicKey::Ed25519(_) => raw,
+        PublicKey::P256(_) => format!("p256:{raw}"),
+    }
+}
+
+/// Reads an author public key line supporting either signature algorithm.
+///
+/// # Errors
+///
+/// Returns an error for an invalid identifier, algorithm or public key.
+pub fn parse_master_key(text: &str) -> Result<(u8, PublicKey), LicenseError> {
+    let (id, key) = text.trim().split_once(':').ok_or(LicenseError::Malformed)?;
+    Ok((
+        id.parse().map_err(|_| LicenseError::Malformed)?,
+        parse_signing_public_key(key)?,
+    ))
+}
+
+/// Encodes an author public key line with its trusted identifier.
+pub fn encode_master_key(id: u8, public: PublicKey) -> String {
+    format!("{id}:{}", encode_signing_public_key(public))
+}
+
+fn serialize_public<S: Serializer>(value: &PublicKey, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&encode_base64(value.as_bytes()))
+}
+
+fn deserialize_public<'de, D: Deserializer<'de>>(de: D) -> Result<PublicKey, D::Error> {
+    let text = String::deserialize(de)?;
+    let key = match text.len() {
+        43 => decode_base64::<32>(&text).map(PublicKey::from),
+        44 => decode_base64::<33>(&text).and_then(|bytes| PublicKey::from_p256_sec1(&bytes)),
+        _ => Err(LicenseError::Malformed),
+    }
+    .map_err(D::Error::custom)?;
+    // URL-safe encoding must be unpadded and the supplied key canonical.
+    key.validate().map_err(D::Error::custom)?;
+    Ok(key)
+}
+
 /// Device-authenticated request to activate a purchase.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,10 +169,10 @@ pub struct ActivateRequest {
     pub entitlement_token: String,
     /// Device public key to bind.
     #[serde(
-        serialize_with = "serialize_bytes",
-        deserialize_with = "deserialize_bytes"
+        serialize_with = "serialize_public",
+        deserialize_with = "deserialize_public"
     )]
-    pub device_pub: [u8; 32],
+    pub device_pub: PublicKey,
     /// Optional diagnostic fingerprint.
     #[serde(
         default,
@@ -162,10 +229,10 @@ pub struct DeactivateRequest {
     pub entitlement_token: Option<String>,
     /// Public key of the seat to release.
     #[serde(
-        serialize_with = "serialize_bytes",
-        deserialize_with = "deserialize_bytes"
+        serialize_with = "serialize_public",
+        deserialize_with = "deserialize_public"
     )]
-    pub device_pub: [u8; 32],
+    pub device_pub: PublicKey,
     /// Fresh random request nonce.
     #[serde(
         serialize_with = "serialize_bytes",
@@ -267,7 +334,7 @@ enum Operation {
 struct ProofInput<'a> {
     operation: Operation,
     token: &'a str,
-    public: [u8; 32],
+    public: PublicKey,
     nonce: Id,
     activation: Option<(AppVersion, Option<Id>)>,
 }
@@ -275,11 +342,21 @@ struct ProofInput<'a> {
 impl ProofInput<'_> {
     fn message(&self, entitlement_id: Id) -> Result<Vec<u8>, LicenseError> {
         let token = zeroize::Zeroizing::new(decode_token(self.token)?);
-        let mut message = Vec::with_capacity(144);
-        message.extend_from_slice(PROOF_DOMAIN);
+        let legacy =
+            token.first() == Some(&1) && self.public.algorithm() == SigningAlgorithm::Ed25519;
+        let mut message = Vec::with_capacity(146);
+        let domain = if legacy {
+            PROOF_DOMAIN
+        } else {
+            PROOF_DOMAIN_V2
+        };
+        message.extend_from_slice(domain);
         message.extend_from_slice(&self.nonce);
         message.extend_from_slice(&entitlement_id);
-        message.extend_from_slice(&self.public);
+        if !legacy {
+            message.push(self.public.algorithm().wire_tag());
+        }
+        message.extend_from_slice(self.public.as_bytes());
         message.push(self.operation as u8);
         message.extend_from_slice(blake3::hash(&token).as_bytes());
         if let Some(((a, b, c), hint)) = self.activation {
@@ -295,12 +372,9 @@ impl ProofInput<'_> {
     }
 
     fn verify(&self, entitlement_id: Id, proof: &[u8; 64]) -> Result<(), LicenseError> {
-        let key = public_key(&self.public).map_err(|_| LicenseError::DeviceProofFailed)?;
-        key.verify_strict(
-            &self.message(entitlement_id)?,
-            &Signature::from_bytes(proof),
-        )
-        .map_err(|_| LicenseError::DeviceProofFailed)
+        self.public
+            .verify(&self.message(entitlement_id)?, proof)
+            .map_err(|_| LicenseError::DeviceProofFailed)
     }
 }
 
@@ -369,7 +443,7 @@ impl RenewRequest {
         Ok(request)
     }
 
-    fn input(&self, public: [u8; 32]) -> ProofInput<'_> {
+    fn input(&self, public: PublicKey) -> ProofInput<'_> {
         ProofInput {
             operation: Operation::Renew,
             token: &self.lease_token,
@@ -387,7 +461,7 @@ impl RenewRequest {
     pub fn verify_proof(
         &self,
         entitlement_id: Id,
-        device_pub: [u8; 32],
+        device_pub: PublicKey,
     ) -> Result<(), LicenseError> {
         self.input(device_pub).verify(entitlement_id, &self.proof)
     }

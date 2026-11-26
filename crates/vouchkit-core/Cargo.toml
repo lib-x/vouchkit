@@ -5,9 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Ed25519-based license format, signing and verification with delegation, leases and revocation."
+description = "Offline license signing and verification with pluggable providers, Ed25519 and ECDSA P-256."
 readme = "README.md"
-keywords = ["license", "licensing", "ed25519", "activation", "signature"]
+keywords = ["license", "licensing", "ed25519", "p256", "signature"]
 categories = ["cryptography", "authentication"]
 
 [lints]
@@ -20,6 +20,7 @@ chacha20poly1305.workspace = true
 ed25519-dalek.workspace = true
 getrandom.workspace = true
 postcard.workspace = true
+p256.workspace = true
 serde.workspace = true
 subtle.workspace = true
 thiserror.workspace = true

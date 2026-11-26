@@ -1,10 +1,10 @@
 # vouchkit-core
 
-Ed25519-based license format, signing and verification with delegation, leases and revocation. Verification has no network dependencies.
+Offline-first license signing and verification with Ed25519, ECDSA P-256 and pluggable providers. Verification has no network dependencies.
 
 ```toml
 [dependencies]
-vouchkit-core = "0.1"
+vouchkit-core = "0.2"
 ```
 
 ```rust
@@ -33,4 +33,6 @@ Generate the public key and license with the `vouch` command from `vouchkit-cli`
 
 Feature slots are inclusive ranges of `u16` IDs. Allocate stable ranges by module and use individual slots for subfeatures. A whole-range grant includes future features you assign to that range.
 
-Optional tags, resource keys and self-tests raise tampering cost. The Ed25519 signature chain is the security boundary. See the [workspace documentation](https://github.com/lib-x/vouchkit) for the protocol and operational limits.
+Use `Verifier::with_public_keys` with algorithm-tagged keys for P-256 or mixed key rings. `Verifier::new` accepts an Ed25519 key ring. Existing `VK1-` tokens remain supported. The `SigningProvider` and `DeviceProver` traits accept runtime-selected software or hardware providers.
+
+Optional tags, resource keys and self-tests raise tampering cost. The signature chain defines the security boundary. See the [workspace documentation](https://github.com/lib-x/vouchkit) for the protocol and operational limits.
