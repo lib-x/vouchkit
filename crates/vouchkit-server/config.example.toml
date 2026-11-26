@@ -1,0 +1,21 @@
+listen = "127.0.0.1:8080"
+database = "activations.sqlite3"
+
+# These files are relative to this configuration file.
+master_public_keys = ["master.pub"]
+delegation_cert = "cert.bin"
+delegate_key = "delegate.key"
+
+# Alternatively set delegate_key_env to the name of a variable that contains
+# the complete text of delegate.key. Configure exactly one DK source.
+# delegate_key_env = "VOUCHKIT_DELEGATE_KEY"
+
+# Copy signed revocation lists from the offline author environment.
+# crl = "crl.bin"
+
+lease_secs = 1_209_600
+grace_secs = 604_800
+
+requests_per_ip_per_minute = 120
+requests_per_entitlement_per_minute = 60
+requests_per_minute = 2_400

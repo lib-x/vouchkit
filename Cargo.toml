@@ -1,0 +1,48 @@
+[workspace]
+members = [
+    "crates/vouchkit-core",
+    "crates/vouchkit-client",
+    "crates/vouchkit-server",
+    "crates/vouchkit-cli",
+]
+exclude = ["fuzz"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/lib-x/vouchkit"
+
+[workspace.dependencies]
+vouchkit-core = { version = "0.1.0", path = "crates/vouchkit-core" }
+vouchkit-client = { version = "0.1.0", path = "crates/vouchkit-client" }
+anyhow = "1"
+argon2 = { version = "0.5", features = ["zeroize"] }
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+blake3 = { version = "1", features = ["zeroize"] }
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.2", features = ["zeroize"] }
+fs2 = "0.4"
+getrandom = "0.3"
+hex = "0.4"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+subtle = "2"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "signal"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize = { version = "1", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

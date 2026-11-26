@@ -1,0 +1,32 @@
+[package]
+name = "vouchkit-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ed25519-based license format, signing and verification with delegation, leases and revocation."
+readme = "README.md"
+keywords = ["license", "licensing", "ed25519", "activation", "signature"]
+categories = ["cryptography", "authentication"]
+
+[lints]
+workspace = true
+
+[dependencies]
+base64.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+ed25519-dalek.workspace = true
+getrandom.workspace = true
+postcard.workspace = true
+serde.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[features]
+test-util = []
+
+[dev-dependencies]
+proptest = "1"

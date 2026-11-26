@@ -1,0 +1,31 @@
+[package]
+name = "vouchkit-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The vouch command-line tool for issuing, inspecting, verifying and revoking licenses."
+readme = "README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+vouchkit-core.workspace = true
+anyhow.workspace = true
+argon2.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+clap.workspace = true
+fs2.workspace = true
+hex.workspace = true
+rpassword = "7"
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+zeroize.workspace = true
+
+[[bin]]
+name = "vouch"
+path = "src/main.rs"
